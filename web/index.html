@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vigie — trafic maritime</title>
+  <meta name="description" content="Suivi du trafic maritime en temps réel : positions AIS, congestion, retards et anomalies.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b1d33'/%3E%3Cpath d='M16 6 L23 25 L16 21 L9 25 Z' fill='%23ff8a3d'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="/static/style.css?v=7">
+</head>
+<body>
+  <div id="app">
+    <aside id="panel" aria-label="Tableau de bord">
+      <header class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32"><path d="M16 5 L24 26 L16 21.5 L8 26 Z"/></svg>
+        </div>
+        <div class="brand-text">
+          <h1>Vigie</h1>
+          <p>Trafic maritime en temps réel</p>
+        </div>
+        <button id="theme-toggle" class="icon-btn" title="Basculer le thème clair / sombre" aria-label="Basculer le thème">
+          <svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        </button>
+      </header>
+
+      <div class="live-row">
+        <span class="live-dot" id="live-dot"></span>
+        <span id="live-text">Connexion…</span>
+        <span class="source-badge" id="source-badge">AIS</span>
+      </div>
+
+      <section class="kpis" aria-label="Indicateurs">
+        <div class="kpi"><span class="kpi-value" id="kpi-active">–</span><span class="kpi-label">Navires actifs</span></div>
+        <div class="kpi"><span class="kpi-value" id="kpi-moving">–</span><span class="kpi-label">En route</span></div>
+        <div class="kpi"><span class="kpi-value" id="kpi-anchored">–</span><span class="kpi-label">Au mouillage</span></div>
+        <div class="kpi kpi-warn"><span class="kpi-value" id="kpi-delayed">–</span><span class="kpi-label">En retard</span></div>
+        <div class="kpi kpi-alert"><span class="kpi-value" id="kpi-zones">–</span><span class="kpi-label">Zones saturées</span></div>
+        <div class="kpi kpi-alert"><span class="kpi-value" id="kpi-alerts">–</span><span class="kpi-label">Alertes (1 h)</span></div>
+      </section>
+
+      <section class="search">
+        <label class="search-box">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input id="search" type="search" placeholder="Nom, MMSI, IMO, indicatif, destination…" autocomplete="off" aria-label="Rechercher un navire">
+        </label>
+        <ul id="search-results" class="search-results" hidden></ul>
+      </section>
+
+      <section class="filters" aria-label="Filtres">
+        <div class="filter-head">
+          <h2>Type de navire</h2>
+          <button id="reset-filters" class="link-btn">Réinitialiser</button>
+        </div>
+        <div id="category-chips" class="chips"></div>
+
+        <div class="filter-row">
+          <label class="field">
+            <span>Pavillon</span>
+            <select id="country"><option value="">Tous les pays</option></select>
+          </label>
+        </div>
+
+        <div class="segmented" id="status-filter" role="radiogroup" aria-label="État">
+          <button data-status="" class="active" role="radio" aria-checked="true">Tous</button>
+          <button data-status="moving" role="radio" aria-checked="false">En route</button>
+          <button data-status="stopped" role="radio" aria-checked="false">À l'arrêt</button>
+          <button data-status="delayed" role="radio" aria-checked="false">En retard</button>
+        </div>
+
+        <label class="switch">
+          <input type="checkbox" id="commercial">
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+          <span>Navires de commerce uniquement</span>
+        </label>
+        <p class="filter-count" id="filter-count"></p>
+      </section>
+
+      <nav class="tabs" role="tablist">
+        <button role="tab" class="active" data-tab="alerts">Alertes <span class="tab-badge" id="badge-alerts"></span></button>
+        <button role="tab" data-tab="zones">Zones <span class="tab-badge" id="badge-zones"></span></button>
+        <button role="tab" data-tab="stats">Statistiques</button>
+      </nav>
+
+      <section class="tab-panel" id="tab-alerts">
+        <div class="chips small" id="alert-kinds"></div>
+        <ul class="feed" id="alert-feed"><li class="empty">Aucune alerte pour le moment.</li></ul>
+      </section>
+      <section class="tab-panel" id="tab-zones" hidden>
+        <p class="hint">Cellules de ~5 km où des cargos attendent au mouillage (congestion) ou où la vitesse chute sous la moitié de la normale (ralentissement).</p>
+        <ul class="feed" id="zone-feed"><li class="empty">Aucune zone signalée.</li></ul>
+      </section>
+      <section class="tab-panel" id="tab-stats" hidden>
+        <h3>Flotte active par type</h3>
+        <div id="chart-categories" class="bars"></div>
+        <h3>Débit d'ingestion (positions / min)</h3>
+        <div id="chart-throughput" class="spark"></div>
+        <h3>Anomalies sur 24 h</h3>
+        <div id="chart-anomalies" class="bars"></div>
+      </section>
+
+      <footer class="panel-foot">
+        <a href="/docs" target="_blank" rel="noopener">API</a>
+        <a href="http://localhost:8080" target="_blank" rel="noopener">Kafka UI</a>
+        <span>Données AIS : Digitraffic (CC BY 4.0) · Fond : Esri · Balisage : OpenSeaMap</span>
+      </footer>
+    </aside>
+
+    <main id="map-wrap">
+      <div id="map"></div>
+      <div id="hover-tip" class="hover-tip" hidden></div>
+      <div class="map-legend" id="legend"></div>
+    </main>
+
+    <aside id="drawer" hidden aria-label="Fiche navire">
+      <header class="drawer-head">
+        <div>
+          <p class="drawer-kicker" id="d-kicker"></p>
+          <h2 id="d-name">—</h2>
+        </div>
+        <button class="icon-btn" id="d-close" aria-label="Fermer">
+          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
+        </button>
+      </header>
+      <div class="drawer-actions">
+        <button class="btn primary" id="d-follow">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
+          <span>Suivre ce navire</span>
+        </button>
+        <select id="d-hours" aria-label="Durée de la trajectoire">
+          <option value="2">Trajectoire 2 h</option>
+          <option value="6" selected>Trajectoire 6 h</option>
+          <option value="24">Trajectoire 24 h</option>
+        </select>
+      </div>
+      <div class="drawer-body" id="d-body"></div>
+    </aside>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/static/app.js?v=7"></script>
+</body>
+</html>

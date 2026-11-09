@@ -1,0 +1,36 @@
+[project]
+name = "vigie-maritime"
+version = "1.0.0"
+description = "Suivi du trafic maritime en temps réel : AIS open data -> Kafka -> détection de congestion, retards et anomalies -> carte web"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "confluent-kafka>=2.6",
+    "requests>=2.32",
+    "websockets>=13",
+    "psycopg[binary]>=3.2",
+    "psycopg-pool>=3.2",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+]
+
+[project.optional-dependencies]
+analysis = [
+    "pandas>=2.2",
+    "matplotlib>=3.9",
+    "scikit-learn>=1.5",
+    "sqlalchemy>=2.0",
+    "jupyter>=1.1",
+    "nbconvert>=7.16",
+]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["maritime*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
