@@ -1,0 +1,20 @@
+# Image du job PySpark Structured Streaming (Spark en mode local, dans le conteneur)
+# Debian bookworm : Java 17, pris en charge par Spark 3.5
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openjdk-17-jre-headless procps \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY maritime ./maritime
+RUN pip install ".[spark,dev]"   # dev : pytest, pour lancer les tests Spark dans l'image
+
+# Connecteurs Kafka et PostgreSQL téléchargés à la construction (pas au démarrage)
+ENV SPARK_IVY_DIR=/opt/ivy PORTS_CACHE=/app/data/ports.json SPARK_CHECKPOINT_DIR=/app/checkpoints
+RUN python -m maritime.spark.job --resolve-only
+
+EXPOSE 4040
+CMD ["python", "-m", "maritime.spark.job"]

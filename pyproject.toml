@@ -23,6 +23,8 @@ analysis = [
     "jupyter>=1.1",
     "nbconvert>=7.16",
 ]
+# Job Spark Structured Streaming (nécessite Java 17)
+spark = ["pyspark==3.5.3"]
 dev = ["pytest>=8"]
 
 [build-system]
