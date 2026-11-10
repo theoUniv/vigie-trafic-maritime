@@ -142,7 +142,27 @@ services:
       ollama:
         condition: service_started
 
+  # --- Big Data : agrégats temps réel avec Spark Structured Streaming ------------
+  spark:
+    <<: *app
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: vigie-spark:latest
+    command: ["python", "-m", "maritime.spark.job"]
+    volumes:
+      - ./data:/app/data
+      - spark-checkpoints:/app/checkpoints   # offsets Kafka et état des fenêtres
+    ports:
+      - "4040:4040"   # Spark UI (requêtes de streaming, débit, état)
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
 volumes:
   kafka-data:
   pg-data:
   ollama-models:
+  spark-checkpoints:
