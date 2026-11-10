@@ -495,7 +495,7 @@
         a.mmsi ? el("div", { class: "f-vessel" }, `${flag(a.country_code)} ${a.vessel_name || `MMSI ${a.mmsi}`}`) : null,
         el("div", { class: "f-msg" }, a.message)));
       }
-      $("#badge-alerts").textContent = rows.length ? fmt.format(rows.length) : "";
+      $("#badge-alerts").textContent = rows.length ? (rows.length > 99 ? "99+" : String(rows.length)) : "";
       // Marqueurs : alertes de la dernière heure
       alertsLayer.clearLayers();
       const colors = SEV_COLOR();
@@ -654,7 +654,8 @@
   function richText(text) {
     const frag = document.createDocumentFragment();
     let list = null;
-    for (const raw of String(text || "").split("\n")) {
+    // Les petits modèles ajoutent du markdown (gras, titres) malgré la consigne : on le retire
+    for (const raw of String(text || "").replace(/\*\*/g, "").replace(/^#+\s*/gm, "").split("\n")) {
       const line = raw.trim();
       if (!line) { list = null; continue; }
       const bullet = line.match(/^(?:[-•*]|\d+[.)])\s+(.*)$/);
@@ -724,23 +725,52 @@
     addMsg("user", question);
     chatInput.value = "";
     chatSend.disabled = true;
-    const pending = addMsg("bot pending", "Recherche dans les données…");
+    const started = Date.now();
+    const bubble = addMsg("bot pending", "Le modèle réfléchit…");
+    const status = el("span", { class: "tools" });
+    const used = [];
+    let text = "", answer = null;
+    const setStatus = (msg) => { status.textContent = msg; if (!status.isConnected) bubble.append(status); };
+    const render = () => { bubble.className = "msg bot"; bubble.replaceChildren(richText(text)); bubble.append(status); chatLog.scrollTop = chatLog.scrollHeight; };
+    const tick = setInterval(() => { if (!text) setStatus(`${used.length ? `Consulté : ${used.join(", ")} · ` : ""}${Math.round((Date.now() - started) / 1000)} s`); }, 1000);
     try {
       const r = await fetch("/api/ask", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify({ question, history: state.chat.slice(-6) }),
+        headers: { "Content-Type": "application/json", Accept: "application/x-ndjson" },
+        body: JSON.stringify({ question, history: state.chat.slice(-4) }),
       });
-      const data = await r.json().catch(() => ({}));
-      pending.remove();
-      if (!r.ok) { addMsg("err", data.detail || `Erreur ${r.status}`); return; }
-      const used = [...new Set(data.tool_calls.map((c) => TOOL_LABELS[c.name] || c.name))];
-      addMsg("bot", data.answer || "(réponse vide)", used.length ? el("span", { class: "tools" }, `Sources : ${used.join(", ")}`) : null);
-      state.chat.push({ role: "user", content: question }, { role: "assistant", content: data.answer || "" });
-    } catch {
-      pending.remove();
-      addMsg("err", "Impossible de joindre l'API.");
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}));
+        bubble.remove(); addMsg("err", data.detail || `Erreur ${r.status}`); return;
+      }
+      // Lecture du flux NDJSON : une ligne JSON par événement
+      const reader = r.body.getReader(), dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+          if (!line) continue;
+          const ev = JSON.parse(line);
+          if (ev.type === "tool") { const l = TOOL_LABELS[ev.name] || ev.name; if (!used.includes(l)) used.push(l); setStatus(`Consulte : ${used.join(", ")}…`); }
+          else if (ev.type === "token") { text += ev.text; render(); }
+          else if (ev.type === "reset") { text = ""; }
+          else if (ev.type === "done") { answer = ev.answer; text = ev.answer; }
+          else if (ev.type === "error") { throw new Error(ev.message); }
+        }
+      }
+      if (answer === null) throw new Error("Réponse interrompue.");
+      render();
+      setStatus(`${used.length ? `Sources : ${used.join(", ")} · ` : ""}${Math.round((Date.now() - started) / 1000)} s`);
+      state.chat.push({ role: "user", content: question }, { role: "assistant", content: answer });
+    } catch (e) {
+      bubble.remove();
+      addMsg("err", e.message && !/fetch/i.test(e.message) ? e.message : "Impossible de joindre l'API.");
     } finally {
+      clearInterval(tick);
       chatSend.disabled = false;
       chatInput.focus();
     }

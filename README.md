@@ -221,15 +221,19 @@ navire, zones, alertes, statistiques, dernier bulletin) qui interrogent PostgreS
 formule sa réponse à partir des résultats. Les MMSI cités sont cliquables et ouvrent la fiche du navire.
 
 ```bash
-curl -X POST localhost:8000/api/ask -H "Content-Type: application/json"      -d '{"question": "Quels cargos sont en retard vers Helsinki ?"}'
+curl -N -X POST localhost:8000/api/ask -H "Content-Type: application/json" \
+     -d '{"question": "Quels cargos sont en retard vers Helsinki ?"}'
 ```
 
 Pour désactiver l'IA : `LLM_URL=` (vide) dans `.env`, et ne pas lancer `ollama`.
 Le reste de Vigie fonctionne normalement.
 
-> Sur CPU, un bulletin prend de 20 à 60 s et une réponse de l'assistant jusqu'à une minute (plusieurs
-> allers-retours d'outils). Avec une carte graphique NVIDIA, ajouter une réservation GPU au service
-> `ollama` accélère nettement la génération.
+> Performances mesurées sur CPU (qwen2.5:3b) : environ 50 s par bulletin, et 20 à 30 s par question
+> pour l'assistant. La réponse s'affiche au fil de l'eau : l'interface indique l'outil consulté, puis
+> le texte s'écrit à mesure qu'il est généré. Le modèle reste en mémoire (`OLLAMA_KEEP_ALIVE=24h`) et
+> l'API le précharge au démarrage. Avec une carte graphique NVIDIA, ajouter une réservation GPU au
+> service `ollama` accélère nettement la génération. `qwen2.5:7b` choisit mieux ses outils, mais il
+> est environ deux fois plus lent.
 
 ---
 
@@ -246,7 +250,7 @@ Le reste de Vigie fonctionne normalement.
 | `GET /api/stats` | Indicateurs, répartition par type, débit d'ingestion |
 | `GET /api/meta` | Valeurs disponibles pour les filtres |
 | `GET /api/briefings?limit=10` | Derniers bulletins de situation |
-| `POST /api/ask` | Question en langage naturel à l'assistant (`{"question": "...", "history": [...]}`) |
+| `POST /api/ask` | Question en langage naturel à l'assistant (`{"question": "...", "history": [...]}`), réponse diffusée en NDJSON (`tool`, `token`, `done`) |
 | `GET /api/llm/status` | État du LLM (activé, modèle téléchargé) |
 
 Documentation interactive : http://localhost:8000/docs

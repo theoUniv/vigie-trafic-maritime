@@ -105,10 +105,13 @@ services:
 
   # --- IA : LLM open source servi localement ----------------------------------
   ollama:
-    image: ollama/ollama:0.6.8
+    image: ollama/ollama:0.40.11
     restart: unless-stopped
     ports:
       - "11434:11434"
+    environment:
+      OLLAMA_KEEP_ALIVE: "24h"      # garde le modèle en mémoire (pas de rechargement entre deux questions)
+      OLLAMA_NUM_PARALLEL: "1"      # CPU : une génération à la fois, plus rapide qu'en parallèle
     volumes:
       - ollama-models:/root/.ollama
     healthcheck:
@@ -119,7 +122,7 @@ services:
 
   # Télécharge le modèle une fois (≈ 2 Go pour qwen2.5:3b), puis s'arrête
   ollama-pull:
-    image: ollama/ollama:0.6.8
+    image: ollama/ollama:0.40.11
     restart: "no"
     entrypoint: ["ollama", "pull", "${LLM_MODEL:-qwen2.5:3b}"]
     environment:
