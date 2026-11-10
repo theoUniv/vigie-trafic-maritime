@@ -23,6 +23,7 @@ class Topics:
     static: str = "ais.static"
     alerts: str = "ais.alerts"
     congestion: str = "ais.congestion"
+    briefings: str = "ais.briefings"
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,13 @@ class Settings:
     ais_gap_min: int = field(default_factory=lambda: _env_int("AIS_GAP_MIN", 20))
     alert_cooldown_min: int = field(default_factory=lambda: _env_int("ALERT_COOLDOWN_MIN", 30))
     ports_cache: str = field(default_factory=lambda: _env("PORTS_CACHE", "data/ports.json"))
+
+    # LLM open source servi localement par Ollama (vide = fonctionnalités IA désactivées)
+    llm_url: str = field(default_factory=lambda: _env("LLM_URL", "http://localhost:11434"))
+    llm_model: str = field(default_factory=lambda: _env("LLM_MODEL", "qwen2.5:3b"))
+    llm_timeout_s: int = field(default_factory=lambda: _env_int("LLM_TIMEOUT_S", 180))
+    briefing_interval_min: int = field(default_factory=lambda: _env_int("BRIEFING_INTERVAL_MIN", 15))
+    briefing_window_min: int = field(default_factory=lambda: _env_int("BRIEFING_WINDOW_MIN", 60))
 
 
 settings = Settings()

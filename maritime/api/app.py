@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
@@ -16,6 +17,8 @@ from psycopg_pool import ConnectionPool
 
 from ..ais import CATEGORIES, COMMERCIAL_CATEGORIES, nav_status_label, ship_type_label
 from ..config import settings
+from ..llm.assistant import Assistant
+from ..llm.client import LLMError, OllamaClient
 from ..processing.anomalies import KIND_LABELS
 
 WEB_DIR = Path(os.environ.get("WEB_DIR", Path(__file__).resolve().parents[2] / "web"))
@@ -219,6 +222,115 @@ def stats():
     for k in by_kind:
         k["label"] = KIND_LABELS.get(k["kind"], k["kind"])
     return {"kpi": kpi, "by_category": by_category, "throughput": throughput, "anomalies_24h": by_kind}
+
+
+# --- IA : bulletins et assistant (LLM open source local via Ollama) ------------------
+llm = OllamaClient(settings.llm_url, settings.llm_model, settings.llm_timeout_s)
+
+
+@app.get("/api/llm/status")
+def llm_status():
+    """État du LLM : activé, modèle, serveur joignable et modèle téléchargé."""
+    return {"enabled": llm.enabled, "model": llm.model, "available": llm.available()}
+
+
+@app.get("/api/briefings")
+def briefings(limit: int = Query(10, ge=1, le=100)):
+    """Derniers bulletins de situation (le plus récent en premier)."""
+    return q("""
+        SELECT id, ts, window_min, text, generator, model, duration_s
+        FROM briefings ORDER BY ts DESC LIMIT %(l)s""", {"l": limit})
+
+
+def tool_search_vessels(query: str | None = None, category: str | None = None,
+                        country: str | None = None, status: str | None = None,
+                        limit: int = 15) -> dict:
+    if category and category not in CATEGORIES:
+        category = None
+    where, params = _filters(query or None, [category] if category else None,
+                             [country.upper()] if country else None, status, False, None)
+    params["limit"] = max(1, min(int(limit), 30))
+    total = q(f"SELECT count(*) AS n FROM vessel_state vs JOIN vessels v USING (mmsi) WHERE {where}",
+              params)[0]["n"]
+    rows = q(f"""
+        SELECT vs.mmsi, v.name, v.category, v.country, v.destination,
+               round(vs.sog::numeric, 1) AS vitesse_nd, round(vs.lat::numeric, 3) AS lat,
+               round(vs.lon::numeric, 3) AS lon, vs.eta_estimate->>'status' AS statut_eta
+        FROM vessel_state vs JOIN vessels v USING (mmsi)
+        WHERE {where} ORDER BY vs.sog DESC NULLS LAST LIMIT %(limit)s""", params)
+    for r in rows:
+        r["category"] = CATEGORIES.get(r["category"], r["category"])
+    return {"total": total, "affiches": len(rows), "navires": rows}
+
+
+def tool_vessel_details(mmsi: int) -> dict:
+    try:
+        v = vessel(int(mmsi))
+    except HTTPException:
+        return {"erreur": f"aucun navire avec le MMSI {mmsi}"}
+    keep = ("mmsi", "name", "imo", "callsign", "type_label", "country", "destination", "eta",
+            "length", "draught", "position_ts", "lat", "lon", "sog", "cog", "nav_status_label",
+            "avg_sog_30m", "eta_estimate")
+    out = {k: v.get(k) for k in keep}
+    out["anomalies"] = [{"ts": a["ts"], "type": a["label"], "message": a["message"]}
+                        for a in v["anomalies"][:5]]
+    return out
+
+
+def tool_congestion_zones(min_level: str = "ralentissement") -> list[dict]:
+    return [{k: z[k] for k in ("level", "place", "n_vessels", "n_waiting", "mean_sog", "baseline_sog")}
+            | {"lat": round((z["lat_min"] + z["lat_max"]) / 2, 3),
+               "lon": round((z["lon_min"] + z["lon_max"]) / 2, 3)}
+            for z in congestion(min_level)[:10]]
+
+
+def tool_recent_alerts(hours: float = 2, kind: str | None = None, limit: int = 20) -> list[dict]:
+    rows = anomalies(max(0.1, min(float(hours), 48)), [kind] if kind else None,
+                     max(1, min(int(limit), 30)))
+    return [{"ts": a["ts"], "type": a["label"], "gravite": a["severity"], "mmsi": a["mmsi"],
+             "navire": a["vessel_name"], "message": a["message"]} for a in rows]
+
+
+def tool_traffic_stats() -> dict:
+    s = stats()
+    return {"indicateurs": s["kpi"], "par_type": s["by_category"], "anomalies_24h": s["anomalies_24h"]}
+
+
+def tool_latest_briefing() -> dict:
+    rows = briefings(1)
+    return rows[0] if rows else {"info": "aucun bulletin pour le moment"}
+
+
+assistant = Assistant(llm, {
+    "search_vessels": tool_search_vessels,
+    "vessel_details": tool_vessel_details,
+    "congestion_zones": tool_congestion_zones,
+    "recent_alerts": tool_recent_alerts,
+    "traffic_stats": tool_traffic_stats,
+    "latest_briefing": tool_latest_briefing,
+})
+
+
+class ChatTurn(BaseModel):
+    role: str
+    content: str = Field(max_length=4000)
+
+
+class AskBody(BaseModel):
+    question: str = Field(min_length=2, max_length=500)
+    history: list[ChatTurn] = Field(default_factory=list, max_length=20)
+
+
+@app.post("/api/ask")
+def ask(body: AskBody):
+    """Question en langage naturel : le LLM interroge la base via des outils et répond en français."""
+    if not llm.available():
+        raise HTTPException(503, "Assistant indisponible : LLM non démarré ou modèle en cours de téléchargement")
+    try:
+        result = assistant.ask(body.question, [t.model_dump() for t in body.history])
+    except LLMError as exc:
+        raise HTTPException(502, f"Erreur du LLM : {exc}")
+    return {**result, "model": llm.model}
 
 
 # --- Interface web ---------------------------------------------------------------

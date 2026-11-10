@@ -10,7 +10,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-  <link rel="stylesheet" href="/static/style.css?v=7">
+  <link rel="stylesheet" href="/static/style.css?v=8">
 </head>
 <body>
   <div id="app">
@@ -83,7 +83,9 @@
       <nav class="tabs" role="tablist">
         <button role="tab" class="active" data-tab="alerts">Alertes <span class="tab-badge" id="badge-alerts"></span></button>
         <button role="tab" data-tab="zones">Zones <span class="tab-badge" id="badge-zones"></span></button>
-        <button role="tab" data-tab="stats">Statistiques</button>
+        <button role="tab" data-tab="stats">Stats</button>
+        <button role="tab" data-tab="briefing">Bulletin <span class="tab-dot" id="badge-briefing" hidden></span></button>
+        <button role="tab" data-tab="assistant">Assistant</button>
       </nav>
 
       <section class="tab-panel" id="tab-alerts">
@@ -101,6 +103,24 @@
         <div id="chart-throughput" class="spark"></div>
         <h3>Anomalies sur 24 h</h3>
         <div id="chart-anomalies" class="bars"></div>
+      </section>
+      <section class="tab-panel" id="tab-briefing" hidden>
+        <p class="hint">Bulletin de situation rédigé toutes les 15 min par un LLM open source exécuté localement (Ollama), à partir des alertes et zones publiées dans Kafka.</p>
+        <article class="briefing" id="briefing-current"><p class="muted">Aucun bulletin pour le moment. Le premier arrive environ une minute après le démarrage.</p></article>
+        <details class="briefing-history">
+          <summary>Bulletins précédents</summary>
+          <ul class="feed" id="briefing-feed"></ul>
+        </details>
+      </section>
+      <section class="tab-panel" id="tab-assistant" hidden>
+        <p class="hint">Posez une question sur le trafic. Le LLM local interroge la base de Vigie avant de répondre ; les MMSI cités sont cliquables.</p>
+        <p class="llm-status" id="llm-status"></p>
+        <div class="chat" id="chat-log" aria-live="polite"></div>
+        <div class="chips small" id="chat-suggestions"></div>
+        <form class="chat-form" id="chat-form">
+          <textarea id="chat-input" rows="2" maxlength="500" placeholder="Ex. : Quels cargos sont en retard vers Helsinki ?" aria-label="Question pour l'assistant"></textarea>
+          <button class="btn primary" id="chat-send" type="submit">Envoyer</button>
+        </form>
       </section>
 
       <footer class="panel-foot">
@@ -142,6 +162,6 @@
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>
