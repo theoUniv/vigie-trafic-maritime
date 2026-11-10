@@ -107,6 +107,19 @@ CREATE TABLE IF NOT EXISTS ingest_stats (
     alerts      INT,
     lag_s       REAL
 );
+
+-- Bulletins de situation rédigés par le LLM (service briefer)
+CREATE TABLE IF NOT EXISTS briefings (
+    id          BIGSERIAL PRIMARY KEY,
+    ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    window_min  INT NOT NULL,
+    text        TEXT NOT NULL,
+    generator   TEXT NOT NULL,      -- 'llm' ou 'template' (repli sans LLM)
+    model       TEXT,
+    duration_s  REAL,
+    facts       JSONB
+);
+CREATE INDEX IF NOT EXISTS briefings_ts_idx ON briefings (ts DESC);
 """
 
 
@@ -249,6 +262,8 @@ class Writer:
         self.conn.execute("DELETE FROM anomalies WHERE ts < now() - make_interval(hours => %s)",
                           (retention_hours * 4,))
         self.conn.execute("DELETE FROM vessel_state WHERE ts < now() - interval '24 hours'")
+        self.conn.execute("DELETE FROM briefings WHERE ts < now() - make_interval(hours => %s)",
+                          (retention_hours * 4,))
 
     # --- Reprise après redémarrage -------------------------------------------------
     def load_recent(self, hours: int = 3):

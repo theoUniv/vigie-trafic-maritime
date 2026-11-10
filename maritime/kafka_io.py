@@ -18,6 +18,7 @@ TOPIC_SPECS = {
     settings.topics.static: (1, 7 * 24 * 3600 * 1000),
     settings.topics.alerts: (1, 7 * 24 * 3600 * 1000),
     settings.topics.congestion: (1, 24 * 3600 * 1000),
+    settings.topics.briefings: (1, 7 * 24 * 3600 * 1000),
 }
 
 

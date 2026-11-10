@@ -10,6 +10,9 @@ x-app: &app
   environment: &app-env
     KAFKA_BOOTSTRAP: kafka:29092
     DATABASE_URL: postgresql://vigie:vigie@postgres:5432/vigie
+    # LLM open source local (Ollama). LLM_URL= (vide) dans .env désactive l'IA.
+    LLM_URL: ${LLM_URL-http://ollama:11434}
+    LLM_MODEL: ${LLM_MODEL:-qwen2.5:3b}
   volumes:
     - ./data:/app/data
 
@@ -100,6 +103,43 @@ services:
       processor:
         condition: service_started
 
+  # --- IA : LLM open source servi localement ----------------------------------
+  ollama:
+    image: ollama/ollama:0.6.8
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Télécharge le modèle une fois (≈ 2 Go pour qwen2.5:3b), puis s'arrête
+  ollama-pull:
+    image: ollama/ollama:0.6.8
+    restart: "no"
+    entrypoint: ["ollama", "pull", "${LLM_MODEL:-qwen2.5:3b}"]
+    environment:
+      OLLAMA_HOST: ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  briefer:
+    <<: *app
+    command: ["python", "-m", "maritime.briefer"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+
 volumes:
   kafka-data:
   pg-data:
+  ollama-models:

@@ -24,6 +24,7 @@ Le tout est restitué sur une **carte web interactive** avec filtres et suivi d'
 | Suivre un navire en particulier | Fiche navire, trajectoire sur 2 h, 6 h ou 24 h, profil de vitesse et mode **« Suivre »** (la carte reste centrée) |
 | Visualiser le trafic mondial ou régional sur une carte | Carte Leaflet en canvas (plusieurs milliers de navires orientés selon leur cap), couches zones, alertes et balisage OpenSeaMap |
 | Interface dynamique avec filtres (nom, type, pays) | Recherche (nom, MMSI, IMO, indicatif, destination), filtres type, pavillon, état et commerce, actualisation toutes les 15 s |
+| *Bonus* : IA générative open source | **Bulletin de situation** rédigé toutes les 15 min et **assistant conversationnel** qui interroge la base, avec un LLM à poids ouverts (Qwen 2.5) exécuté localement par **Ollama** |
 | Analyse et modèle de prédiction (rappels) | Notebook `notebooks/analyse_trafic.ipynb` : data viz matplotlib, **prévision de position à 10 min** et **Isolation Forest** |
 
 ---
@@ -47,10 +48,16 @@ flowchart LR
         T2[("ais.static")]
         T3[("ais.alerts")]
         T4[("ais.congestion")]
+        T5[("ais.briefings")]
     end
 
     subgraph Traitement
         PR["processor<br/>état des navires<br/>congestion · ETA · anomalies"]
+    end
+
+    subgraph IA["IA open source (local)"]
+        BR["briefer<br/>bulletin / 15 min"]
+        OL["Ollama<br/>LLM qwen2.5:3b"]
     end
 
     DB[("PostgreSQL<br/>état temps réel<br/>+ historique")]
@@ -68,6 +75,11 @@ flowchart LR
     PR --> DB
     DB --> API --> WEB
     DB --> NB
+    T3 & T4 --> BR
+    BR <--> OL
+    BR --> T5
+    BR --> DB
+    API <-->|"assistant<br/>appels d'outils"| OL
     Kafka --- UI
 ```
 
@@ -79,6 +91,9 @@ flowchart LR
 | `processor` | Kafka → détection → PostgreSQL et topics d'alertes | – |
 | `postgres` | Stockage de l'état courant, de l'historique et des alertes | 5433 |
 | `api` | API REST et interface web | [8000](http://localhost:8000) |
+| `ollama` | Serveur de LLM open source local (modèles à poids ouverts) | 11434 |
+| `ollama-pull` | Télécharge le modèle au premier démarrage puis s'arrête | – |
+| `briefer` | Kafka (alertes, zones) → bulletin rédigé par le LLM → `ais.briefings` et PostgreSQL | – |
 
 **Pourquoi ce découpage ?** Kafka découple la collecte du traitement. Si le processeur
 redémarre, il reprend à son dernier offset sans perdre de message, et il recharge son état récent
@@ -182,6 +197,42 @@ ou par alias. Les itinéraires multi-escales (`SESTO<>FIMHQ<>FIHEL`) sont volont
 
 ---
 
+## IA générative open source (Ollama)
+
+Vigie intègre un **LLM à poids ouverts exécuté localement** par [Ollama](https://ollama.com) :
+aucune donnée ne quitte la machine, aucune clé ni service payant. Le modèle par défaut,
+`qwen2.5:3b` (licence Qwen, ~2 Go), tourne sur CPU, écrit bien le français et sait appeler des
+outils. On peut le changer avec `LLM_MODEL` (`llama3.2:3b`, `mistral:7b`, `qwen2.5:7b`…).
+
+Au premier `docker compose up`, le service `ollama-pull` télécharge le modèle (quelques minutes).
+Suivre l'avancement : `docker compose logs -f ollama-pull briefer`.
+
+**Bulletin de situation (onglet « Bulletin »).** Le service `briefer` est un nouveau consommateur
+Kafka, ajouté sans modifier le producteur ni le processeur. Il lit `ais.alerts` et
+`ais.congestion` et, toutes les 15 minutes, condense la dernière heure en **faits structurés**
+(indicateurs de flotte, alertes par gravité, zones saturées). Il fait ensuite rédiger un
+bulletin en français par le LLM, publié sur `ais.briefings` et stocké en base. Le LLM ne reçoit que
+des faits calculés par le pipeline et il a pour consigne de ne rien inventer. Si le LLM est
+indisponible, un **bulletin gabarit** déterministe est produit à la place.
+
+**Assistant (onglet « Assistant »).** `POST /api/ask` utilise l'**appel d'outils** (*tool calling*) :
+le modèle ne connaît pas les données, il choisit parmi six outils (recherche de navires, fiche
+navire, zones, alertes, statistiques, dernier bulletin) qui interrogent PostgreSQL, puis
+formule sa réponse à partir des résultats. Les MMSI cités sont cliquables et ouvrent la fiche du navire.
+
+```bash
+curl -X POST localhost:8000/api/ask -H "Content-Type: application/json"      -d '{"question": "Quels cargos sont en retard vers Helsinki ?"}'
+```
+
+Pour désactiver l'IA : `LLM_URL=` (vide) dans `.env`, et ne pas lancer `ollama`.
+Le reste de Vigie fonctionne normalement.
+
+> Sur CPU, un bulletin prend de 20 à 60 s et une réponse de l'assistant jusqu'à une minute (plusieurs
+> allers-retours d'outils). Avec une carte graphique NVIDIA, ajouter une réservation GPU au service
+> `ollama` accélère nettement la génération.
+
+---
+
 ## API REST
 
 | Endpoint | Description |
@@ -194,6 +245,9 @@ ou par alias. Les itinéraires multi-escales (`SESTO<>FIMHQ<>FIHEL`) sont volont
 | `GET /api/anomalies?hours=6&kind=` | Flux d'alertes |
 | `GET /api/stats` | Indicateurs, répartition par type, débit d'ingestion |
 | `GET /api/meta` | Valeurs disponibles pour les filtres |
+| `GET /api/briefings?limit=10` | Derniers bulletins de situation |
+| `POST /api/ask` | Question en langage naturel à l'assistant (`{"question": "...", "history": [...]}`) |
+| `GET /api/llm/status` | État du LLM (activé, modèle téléchargé) |
 
 Documentation interactive : http://localhost:8000/docs
 
@@ -228,8 +282,10 @@ uv venv && uv pip install -e ".[analysis,dev]"     # ou : pip install -e ".[anal
 .venv/bin/python -m pytest
 ```
 
-Les 47 tests couvrent la géographie, le décodage AIS (ETA, pavillons, valeurs sentinelles), la
+Les 59 tests couvrent la géographie, le décodage AIS (ETA, pavillons, valeurs sentinelles), la
 résolution des destinations, les détecteurs d'anomalies, la congestion et l'estimation d'ETA.
+Ils couvrent aussi la couche IA (faits du bulletin, gabarit de repli, boucle d'appel d'outils),
+testée avec un faux client, donc sans LLM.
 
 ---
 
@@ -247,6 +303,8 @@ maritime/
   processing/          state, anomalies, congestion, eta (logique pure)
   processor.py         Kafka → détection → PostgreSQL et topics d'alertes
   db.py                schéma et écritures PostgreSQL
+  llm/                 client Ollama, bulletin (faits + prompt), assistant (outils)
+  briefer.py           Kafka → bulletin rédigé par le LLM → ais.briefings et PostgreSQL
   api/app.py           API FastAPI et service de l'interface
 web/                   interface (HTML, CSS, JS, Leaflet)
 notebooks/             analyse et modèles

@@ -637,11 +637,128 @@
     text.textContent = lastPos ? `En direct · dernière position ${ago(state.lastPosition)}` : "En attente des premières positions…";
   }
 
+  // ------------------------------------------------- IA : bulletin et assistant
+  // Texte du LLM -> paragraphes et listes ; les MMSI (9 chiffres) deviennent des liens vers la fiche navire.
+  function linkify(text) {
+    const parts = [];
+    let last = 0;
+    for (const m of text.matchAll(/\b\d{9}\b/g)) {
+      if (m.index > last) parts.push(text.slice(last, m.index));
+      const mmsi = Number(m[0]);
+      parts.push(el("button", { class: "mmsi-link", type: "button", title: "Voir la fiche du navire", onclick: () => selectVessel(mmsi, true) }, m[0]));
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) parts.push(text.slice(last));
+    return parts;
+  }
+  function richText(text) {
+    const frag = document.createDocumentFragment();
+    let list = null;
+    for (const raw of String(text || "").split("\n")) {
+      const line = raw.trim();
+      if (!line) { list = null; continue; }
+      const bullet = line.match(/^(?:[-•*]|\d+[.)])\s+(.*)$/);
+      if (bullet) {
+        if (!list) { list = el("ul"); frag.append(list); }
+        list.append(el("li", {}, linkify(bullet[1])));
+      } else {
+        list = null;
+        frag.append(el("p", {}, linkify(line)));
+      }
+    }
+    return frag;
+  }
+
+  const genBadge = (b) => el("span", { class: `gen-badge ${b.generator}` },
+    b.generator === "llm" ? `LLM · ${b.model}` : "gabarit (LLM indisponible)");
+
+  async function refreshBriefing() {
+    try {
+      const rows = await api("/api/briefings?limit=8");
+      const box = $("#briefing-current");
+      if (!rows.length) return;
+      const [cur, ...older] = rows;
+      if (cur.id !== state.briefingId) {
+        box.innerHTML = "";
+        box.append(richText(cur.text), el("div", { class: "briefing-meta" },
+          genBadge(cur), el("span", {}, `${fmtDate(cur.ts)} · ${ago(cur.ts)}`),
+          cur.duration_s ? el("span", {}, `rédigé en ${Number(cur.duration_s).toFixed(0)} s`) : null,
+          el("span", {}, `période : ${cur.window_min} min`)));
+        const feed = $("#briefing-feed");
+        feed.innerHTML = "";
+        for (const b of older) feed.append(el("li", {}, el("div", { class: "f-top" }, el("span", {}, fmtDate(b.ts)), genBadge(b)), b.text));
+        if (state.briefingId && store.get("vigie.tab", "") !== "briefing") $("#badge-briefing").hidden = false;
+        state.briefingId = cur.id;
+      }
+    } catch { /* réessai */ }
+  }
+
+  async function refreshLlmStatus() {
+    const box = $("#llm-status");
+    try {
+      const s = await api("/api/llm/status");
+      state.llmOk = s.available;
+      box.className = `llm-status ${s.available ? "ok" : "off"}`;
+      box.textContent = !s.enabled ? "IA désactivée (LLM_URL vide)"
+        : s.available ? `Modèle ${s.model} prêt (exécution locale)`
+        : `Modèle ${s.model} indisponible : démarrage ou téléchargement en cours`;
+    } catch { box.className = "llm-status off"; box.textContent = "API injoignable"; }
+  }
+
+  const chatLog = $("#chat-log"), chatInput = $("#chat-input"), chatSend = $("#chat-send");
+  state.chat = [];
+  function addMsg(kind, content, extra) {
+    const node = el("div", { class: `msg ${kind}` });
+    if (kind === "bot") node.append(richText(content)); else node.append(content);
+    if (extra) node.append(extra);
+    chatLog.append(node);
+    chatLog.scrollTop = chatLog.scrollHeight;
+    return node;
+  }
+  const TOOL_LABELS = { search_vessels: "recherche navires", vessel_details: "fiche navire", congestion_zones: "zones",
+    recent_alerts: "alertes", traffic_stats: "statistiques", latest_briefing: "bulletin" };
+
+  async function askAssistant(question) {
+    question = question.trim();
+    if (question.length < 2 || chatSend.disabled) return;
+    addMsg("user", question);
+    chatInput.value = "";
+    chatSend.disabled = true;
+    const pending = addMsg("bot pending", "Recherche dans les données…");
+    try {
+      const r = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ question, history: state.chat.slice(-6) }),
+      });
+      const data = await r.json().catch(() => ({}));
+      pending.remove();
+      if (!r.ok) { addMsg("err", data.detail || `Erreur ${r.status}`); return; }
+      const used = [...new Set(data.tool_calls.map((c) => TOOL_LABELS[c.name] || c.name))];
+      addMsg("bot", data.answer || "(réponse vide)", used.length ? el("span", { class: "tools" }, `Sources : ${used.join(", ")}`) : null);
+      state.chat.push({ role: "user", content: question }, { role: "assistant", content: data.answer || "" });
+    } catch {
+      pending.remove();
+      addMsg("err", "Impossible de joindre l'API.");
+    } finally {
+      chatSend.disabled = false;
+      chatInput.focus();
+    }
+  }
+  $("#chat-form").addEventListener("submit", (e) => { e.preventDefault(); askAssistant(chatInput.value); });
+  chatInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); askAssistant(chatInput.value); }
+  });
+  for (const s of ["Résume la situation actuelle", "Quelles zones sont congestionnées ?", "Quels navires sont en retard ?", "Y a-t-il des arrêts en mer suspects ?"]) {
+    $("#chat-suggestions").append(el("button", { class: "chip", type: "button", onclick: () => askAssistant(s) }, s));
+  }
+
   // ------------------------------------------------------------------ onglets
   document.querySelectorAll(".tabs button").forEach((b) => b.addEventListener("click", () => {
     document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("active", x === b));
     document.querySelectorAll(".tab-panel").forEach((p) => { p.hidden = p.id !== `tab-${b.dataset.tab}`; });
     store.set("vigie.tab", b.dataset.tab);
+    if (b.dataset.tab === "briefing") $("#badge-briefing").hidden = true;
   }));
   const savedTab = store.get("vigie.tab", "alerts");
   document.querySelector(`.tabs button[data-tab="${savedTab}"]`)?.click();
@@ -654,7 +771,11 @@
   refreshStats().then(refreshVessels);
   refreshAlerts();
   refreshZones();
+  refreshBriefing();
+  refreshLlmStatus();
   setInterval(refreshVessels, 15000);
+  setInterval(refreshBriefing, 60000);
+  setInterval(refreshLlmStatus, 30000);
   setInterval(refreshStats, 15000);
   setInterval(() => { refreshAlerts(); refreshZones(); }, 30000);
   setInterval(refreshMeta, 60000);
