@@ -4,13 +4,15 @@
 """
 from __future__ import annotations
 
+import json
 import os
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -30,6 +32,8 @@ async def lifespan(_app: FastAPI):
     global pool
     pool = ConnectionPool(settings.database_url, min_size=1, max_size=8,
                           kwargs={"row_factory": dict_row, "autocommit": True}, open=True)
+    # Précharge le modèle en arrière-plan pour que la première question ne paie pas le chargement
+    threading.Thread(target=llm.warmup, daemon=True).start()
     yield
     pool.close()
 
@@ -242,25 +246,31 @@ def briefings(limit: int = Query(10, ge=1, le=100)):
         FROM briefings ORDER BY ts DESC LIMIT %(l)s""", {"l": limit})
 
 
+def _num(v, nd=1):
+    return None if v is None else round(float(v), nd)
+
+
+# Les outils renvoient des champs courts et explicites en français : un petit modèle lit moins de
+# texte (plus rapide sur CPU) et confond moins les grandeurs.
 def tool_search_vessels(query: str | None = None, category: str | None = None,
                         country: str | None = None, status: str | None = None,
-                        limit: int = 15) -> dict:
+                        limit: int = 10) -> dict:
     if category and category not in CATEGORIES:
         category = None
     where, params = _filters(query or None, [category] if category else None,
                              [country.upper()] if country else None, status, False, None)
-    params["limit"] = max(1, min(int(limit), 30))
+    params["limit"] = max(1, min(int(limit), 20))
     total = q(f"SELECT count(*) AS n FROM vessel_state vs JOIN vessels v USING (mmsi) WHERE {where}",
               params)[0]["n"]
     rows = q(f"""
-        SELECT vs.mmsi, v.name, v.category, v.country, v.destination,
-               round(vs.sog::numeric, 1) AS vitesse_nd, round(vs.lat::numeric, 3) AS lat,
-               round(vs.lon::numeric, 3) AS lon, vs.eta_estimate->>'status' AS statut_eta
+        SELECT vs.mmsi, v.name, v.category, v.country, v.destination, vs.sog,
+               vs.eta_estimate->>'status' AS eta_status
         FROM vessel_state vs JOIN vessels v USING (mmsi)
         WHERE {where} ORDER BY vs.sog DESC NULLS LAST LIMIT %(limit)s""", params)
-    for r in rows:
-        r["category"] = CATEGORIES.get(r["category"], r["category"])
-    return {"total": total, "affiches": len(rows), "navires": rows}
+    return {"nombre_total": total, "navires": [
+        {"nom": r["name"], "mmsi": r["mmsi"], "type": CATEGORIES.get(r["category"], r["category"]),
+         "pavillon": r["country"], "destination": r["destination"], "vitesse_nd": _num(r["sog"]),
+         "statut_eta": r["eta_status"]} for r in rows]}
 
 
 def tool_vessel_details(mmsi: int) -> dict:
@@ -268,37 +278,56 @@ def tool_vessel_details(mmsi: int) -> dict:
         v = vessel(int(mmsi))
     except HTTPException:
         return {"erreur": f"aucun navire avec le MMSI {mmsi}"}
-    keep = ("mmsi", "name", "imo", "callsign", "type_label", "country", "destination", "eta",
-            "length", "draught", "position_ts", "lat", "lon", "sog", "cog", "nav_status_label",
-            "avg_sog_30m", "eta_estimate")
-    out = {k: v.get(k) for k in keep}
-    out["anomalies"] = [{"ts": a["ts"], "type": a["label"], "message": a["message"]}
-                        for a in v["anomalies"][:5]]
-    return out
+    est = v.get("eta_estimate") or {}
+    return {
+        "nom": v["name"], "mmsi": v["mmsi"], "imo": v["imo"], "type": v["type_label"],
+        "pavillon": v["country"], "longueur_m": v["length"], "tirant_eau_m": v["draught"],
+        "etat_ais": v["nav_status_label"], "vitesse_nd": _num(v["sog"]),
+        "vitesse_moy_30min_nd": _num(v["avg_sog_30m"]), "cap": _num(v["cog"], 0),
+        "position": {"lat": _num(v["lat"], 3), "lon": _num(v["lon"], 3)} if v["lat"] is not None else None,
+        "derniere_position": v["position_ts"], "destination": v["destination"],
+        "eta_declaree": v["eta"], "eta_estimee": est or None,
+        "anomalies_recentes": [{"date": a["ts"], "type": a["label"], "message": a["message"]}
+                               for a in v["anomalies"][:5]],
+    }
 
 
-def tool_congestion_zones(min_level: str = "ralentissement") -> list[dict]:
-    return [{k: z[k] for k in ("level", "place", "n_vessels", "n_waiting", "mean_sog", "baseline_sog")}
-            | {"lat": round((z["lat_min"] + z["lat_max"]) / 2, 3),
-               "lon": round((z["lon_min"] + z["lon_max"]) / 2, 3)}
-            for z in congestion(min_level)[:10]]
+ZONE_LABELS = {"congestion": "congestion", "ralentissement": "ralentissement", "dense": "trafic dense"}
 
 
-def tool_recent_alerts(hours: float = 2, kind: str | None = None, limit: int = 20) -> list[dict]:
+def tool_congestion_zones(min_level: str = "ralentissement") -> dict:
+    zones = congestion(min_level)
+    return {"nombre_zones": len(zones), "zones": [
+        {"niveau": ZONE_LABELS.get(z["level"], z["level"]), "lieu": z["place"] or "en mer",
+         "navires_dans_la_zone": z["n_vessels"], "cargos_en_attente": z["n_waiting"],
+         "vitesse_moyenne_nd": _num(z["mean_sog"]), "vitesse_habituelle_nd": _num(z["baseline_sog"])}
+        for z in zones[:8]]}
+
+
+def tool_recent_alerts(hours: float = 2, kind: str | None = None, limit: int = 15) -> dict:
     rows = anomalies(max(0.1, min(float(hours), 48)), [kind] if kind else None,
-                     max(1, min(int(limit), 30)))
-    return [{"ts": a["ts"], "type": a["label"], "gravite": a["severity"], "mmsi": a["mmsi"],
-             "navire": a["vessel_name"], "message": a["message"]} for a in rows]
+                     max(1, min(int(limit), 20)))
+    return {"alertes": [{"date": a["ts"], "type": a["label"], "gravite": a["severity"],
+                         "navire": a["vessel_name"], "mmsi": a["mmsi"], "message": a["message"]}
+                        for a in rows]}
 
 
 def tool_traffic_stats() -> dict:
     s = stats()
-    return {"indicateurs": s["kpi"], "par_type": s["by_category"], "anomalies_24h": s["anomalies_24h"]}
+    k = s["kpi"]
+    return {
+        "navires_actifs": k["active"], "en_route": k["moving"], "au_mouillage": k["anchored"],
+        "a_quai": k["moored"], "navires_en_retard": k["delayed"],
+        "vitesse_moyenne_en_route_nd": _num(k["mean_speed"]), "alertes_derniere_heure": k["alerts_1h"],
+        "zones_congestion_ou_ralentissement": k["congested_zones"],
+        "navires_par_type": {c["label"]: c["n"] for c in s["by_category"]},
+        "alertes_24h_par_type": {a["label"]: a["n"] for a in s["anomalies_24h"]},
+    }
 
 
 def tool_latest_briefing() -> dict:
     rows = briefings(1)
-    return rows[0] if rows else {"info": "aucun bulletin pour le moment"}
+    return {"date": rows[0]["ts"], "texte": rows[0]["text"]} if rows else {"info": "aucun bulletin pour le moment"}
 
 
 assistant = Assistant(llm, {
@@ -323,14 +352,24 @@ class AskBody(BaseModel):
 
 @app.post("/api/ask")
 def ask(body: AskBody):
-    """Question en langage naturel : le LLM interroge la base via des outils et répond en français."""
+    """Question en langage naturel : le LLM interroge la base via des outils et répond en français.
+
+    Réponse diffusée en NDJSON (une ligne JSON par événement) : `tool` (outil appelé), `token`
+    (texte au fil de l'eau), `reset` (texte à effacer), `done` (réponse finale) ou `error`.
+    """
     if not llm.available():
         raise HTTPException(503, "Assistant indisponible : LLM non démarré ou modèle en cours de téléchargement")
-    try:
-        result = assistant.ask(body.question, [t.model_dump() for t in body.history])
-    except LLMError as exc:
-        raise HTTPException(502, f"Erreur du LLM : {exc}")
-    return {**result, "model": llm.model}
+    history = [t.model_dump() for t in body.history]
+
+    def events():
+        try:
+            for ev in assistant.ask_stream(body.question, history):
+                yield json.dumps(ev, ensure_ascii=False, default=str) + "\n"
+        except LLMError as exc:
+            yield json.dumps({"type": "error", "message": f"Erreur du LLM : {exc}"}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(events(), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # --- Interface web ---------------------------------------------------------------

@@ -5,6 +5,7 @@ pipeline, ce qui limite les hallucinations, et un gabarit déterministe sert de 
 """
 from __future__ import annotations
 
+import re
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -18,12 +19,26 @@ SYSTEM_PROMPT = """Tu es l'officier de quart d'un centre de surveillance du traf
 Rédige en français un bulletin de situation clair et factuel, à partir UNIQUEMENT des faits JSON
 fournis. N'invente aucun navire, chiffre, lieu ni cause. Si une information manque, ne la mentionne pas.
 
-Format (texte brut, pas de titre ni de markdown gras) :
-1. Une ou deux phrases de synthèse de la situation générale (navires actifs, niveau d'activité).
-2. Une ligne « Points d'attention : » suivie de 2 à 5 puces commençant par « - », du plus grave
-   au moins grave (zones congestionnées, alertes critiques, retards).
-3. Une ligne « À surveiller : » avec une phrase de recommandation.
-Si la situation est calme, dis-le simplement. 180 mots maximum."""
+Sens des champs (ne les confonds pas) :
+- flotte.navires_en_retard : navires dont l'arrivée estimée dépasse l'ETA déclarée par l'équipage.
+- alertes_total : nombre d'ALERTES détectées sur la période (ce n'est pas un nombre de navires).
+- zones[].cargos_en_attente : cargos à l'arrêt ou au mouillage dans la zone.
+- zones[].vitesse_habituelle_nd : vitesse normale apprise pour la zone, à comparer à vitesse_moyenne_nd.
+
+Format, en texte brut, sans numérotation, sans titre ni gras :
+- Commence directement par une ou deux phrases de synthèse (nombre de navires actifs, niveau d'activité).
+- Puis la ligne « Points d'attention : » suivie de 2 à 5 puces commençant par « - », du plus grave au
+  moins grave (zones congestionnées avec leur lieu, alertes critiques, retards notables avec le nom du navire).
+- Termine par une ligne commençant par « À surveiller : » avec une phrase de recommandation.
+
+Exemple de forme (chiffres fictifs, à remplacer par les vrais faits) :
+Activité soutenue avec 650 navires actifs, dont 200 en route.
+Points d'attention :
+- Congestion près de Kotka : 5 cargos en attente, vitesse moyenne 0,2 nd.
+- Arrêt en mer inattendu du navire NORDIC STAR.
+À surveiller : la file d'attente devant Kotka.
+
+Si la situation est calme, dis-le simplement. 150 mots maximum."""
 
 
 def _minutes_ago(ts_ms: int | None, now_ms: int) -> int | None:
@@ -49,7 +64,7 @@ def build_facts(alerts: list[dict], cells: list[dict], kpi: dict, window_min: in
             "en_route": kpi.get("moving"),
             "au_mouillage": kpi.get("anchored"),
             "a_quai": kpi.get("moored"),
-            "en_retard": kpi.get("delayed"),
+            "navires_en_retard": kpi.get("delayed"),
             "vitesse_moyenne_nd": float(kpi["mean_speed"]) if kpi.get("mean_speed") is not None else None,
         },
         "alertes_total": len(recent),
@@ -67,19 +82,36 @@ def build_facts(alerts: list[dict], cells: list[dict], kpi: dict, window_min: in
             }
             for a in notable[:max_alerts]
         ],
-        "zones": [
-            {
-                "niveau": LEVEL_LABELS[c["level"]],
-                "lieu": c.get("place") or f"{(c['lat_min'] + c['lat_max']) / 2:.2f}N "
-                                         f"{(c['lon_min'] + c['lon_max']) / 2:.2f}E",
-                "navires": c.get("n_vessels"),
-                "cargos_en_attente": c.get("n_waiting"),
-                "vitesse_moyenne_nd": round(c["mean_sog"], 1) if c.get("mean_sog") is not None else None,
-                "vitesse_normale_nd": round(c["baseline_sog"], 1) if c.get("baseline_sog") else None,
-            }
-            for c in zones[:max_zones]
-        ],
+        "zones": _merge_zones(zones)[:max_zones],
     }
+
+
+def _merge_zones(cells: list[dict]) -> list[dict]:
+    """Une entrée par lieu : un port couvre souvent plusieurs cellules de la grille de 5 km,
+    que le LLM répéterait sinon. Les cellules déjà triées gardent leur ordre de gravité."""
+    merged: dict[tuple, dict] = {}
+    for c in cells:
+        place = c.get("place") or (f"{(c['lat_min'] + c['lat_max']) / 2:.2f}N "
+                                   f"{(c['lon_min'] + c['lon_max']) / 2:.2f}E")
+        key = (place, c["level"])
+        z = merged.get(key)
+        if z is None:
+            merged[key] = z = {"niveau": LEVEL_LABELS[c["level"]], "lieu": place, "navires": 0,
+                               "cargos_en_attente": 0, "_sog": [], "_base": []}
+        z["navires"] += c.get("n_vessels") or 0
+        z["cargos_en_attente"] += c.get("n_waiting") or 0
+        if c.get("mean_sog") is not None:
+            z["_sog"].append((c["mean_sog"], c.get("n_vessels") or 1))
+        if c.get("baseline_sog"):
+            z["_base"].append(c["baseline_sog"])
+    out = []
+    for z in merged.values():
+        sog, base = z.pop("_sog"), z.pop("_base")
+        weight = sum(w for _, w in sog)
+        z["vitesse_moyenne_nd"] = round(sum(v * w for v, w in sog) / weight, 1) if weight else None
+        z["vitesse_habituelle_nd"] = round(sum(base) / len(base), 1) if base else None
+        out.append(z)
+    return out
 
 
 def briefing_messages(facts: dict) -> list[dict]:
@@ -95,7 +127,10 @@ def clean_output(text: str) -> str:
     text = (text or "").strip()
     if text.startswith("```"):
         text = text.strip("`").split("\n", 1)[-1]
-    return text.replace("**", "").strip()
+    text = text.replace("**", "")
+    # Numérotation de sections (« 1. Synthèse : ») que les petits modèles ajoutent malgré la consigne
+    text = re.sub(r"(?m)^\s*\d+[.)]\s+", "", text)
+    return text.strip()
 
 
 def template_bulletin(facts: dict) -> str:
@@ -113,6 +148,6 @@ def template_bulletin(facts: dict) -> str:
         lines.extend(points)
     else:
         lines.append("Points d'attention : aucun, la situation est calme.")
-    if f.get("en_retard"):
-        lines.append(f"À surveiller : {f['en_retard']} navire(s) en retard probable par rapport à leur ETA déclarée.")
+    if f.get("navires_en_retard"):
+        lines.append(f"À surveiller : {f['navires_en_retard']} navire(s) en retard probable par rapport à leur ETA déclarée.")
     return "\n".join(lines)

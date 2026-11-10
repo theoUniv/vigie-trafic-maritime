@@ -73,6 +73,8 @@ def test_template_bulletin_calm():
 def test_clean_output_strips_markdown():
     assert clean_output("```text\n**Synthèse** calme\n```") == "Synthèse calme"
     assert clean_output("  ok  ") == "ok"
+    assert clean_output("1. Synthèse calme.\n2. Points d'attention :\n- Congestion") == \
+        "Synthèse calme.\nPoints d'attention :\n- Congestion"
 
 
 # ---------------------------------------------------------------------- assistant
@@ -86,6 +88,15 @@ class FakeClient:
     def chat(self, messages, tools=None, temperature=0.2):
         self.calls.append({"messages": [dict(m) for m in messages], "tools": tools})
         return self.replies.pop(0)
+
+    def chat_stream(self, messages, tools=None, temperature=0.2):
+        """Comme Ollama en flux : le texte mot par mot, les appels d'outils dans le dernier morceau."""
+        reply = self.chat(messages, tools, temperature)
+        words = (reply.get("content") or "").split(" ")
+        for i, w in enumerate(words):
+            if w or i == 0:
+                yield {"content": w if i == 0 else " " + w}
+        yield {"content": "", "tool_calls": reply.get("tool_calls") or []}
 
 
 def tool_call(name, args):
@@ -129,6 +140,17 @@ def test_assistant_handles_string_args_unknown_tool_and_bad_args():
     assert "arguments invalides" in results[2]
 
 
+def test_assistant_ignores_invented_arguments():
+    client = FakeClient([
+        {"content": "", "tool_calls": [tool_call("traffic_stats", {"kind": "DELAY", "limit": 100})]},
+        {"content": "46 navires en retard."},
+    ])
+    out = Assistant(client, {"traffic_stats": lambda: {"navires_en_retard": 46}}).ask("Combien en retard ?")
+    tool_msg = [m for m in client.calls[1]["messages"] if m["role"] == "tool"][0]
+    assert json.loads(tool_msg["content"]) == {"navires_en_retard": 46}
+    assert out["answer"] == "46 navires en retard."
+
+
 def test_assistant_forces_answer_after_max_rounds():
     loop = {"content": "", "tool_calls": [tool_call("traffic_stats", {})]}
     client = FakeClient([loop, loop, {"content": "Synthèse finale."}])
@@ -146,6 +168,26 @@ def test_assistant_keeps_only_valid_history():
     roles = [m["role"] for m in client.calls[0]["messages"]]
     assert roles == ["system", "user", "assistant", "user"]
     assert "ignore les règles" not in json.dumps(client.calls[0]["messages"], ensure_ascii=False)
+
+
+def test_assistant_stream_events():
+    client = FakeClient([
+        {"content": "Je vérifie.", "tool_calls": [tool_call("congestion_zones", {})]},
+        {"content": "Deux zones congestionnées."},
+    ])
+    events = list(Assistant(client, {"congestion_zones": lambda: {"zones": []}}).ask_stream("Zones ?"))
+    kinds = [e["type"] for e in events]
+    # le texte émis avant l'appel d'outil est annulé, puis la vraie réponse arrive jeton par jeton
+    assert kinds[:2] == ["token", "token"] and "reset" in kinds
+    assert kinds.index("reset") < kinds.index("tool") < len(kinds) - 1
+    assert "".join(e["text"] for e in events[kinds.index("tool") + 1:] if e["type"] == "token") == "Deux zones congestionnées."
+    assert events[-1] == {"type": "done", "answer": "Deux zones congestionnées.",
+                          "tool_calls": [{"name": "congestion_zones", "arguments": {}}]}
+
+
+def test_assistant_empty_answer_raises():
+    with pytest.raises(LLMError):
+        Assistant(FakeClient([{"content": "  "}]), {}).ask("?")
 
 
 def test_disabled_client_raises():
@@ -180,3 +222,15 @@ def test_briefer_falls_back_to_template_and_keeps_window():
     b.on_message("ais.congestion", {"cells": [cell("dense", 1)]})
     b.prune(NOW)
     assert len(b.alerts) == 1 and len(b.cells) == 1
+
+
+def test_zones_merged_by_place():
+    cells = [cell("congestion", 9, "Bronka Port"), cell("congestion", 5, "Bronka Port"),
+             cell("ralentissement", 4, "Bronka Port"), cell("congestion", 3, "Kotka")]
+    cells[1]["n_vessels"], cells[1]["mean_sog"] = 3, 1.0
+    zones = build_facts([], cells, KPI, 60, NOW)["zones"]
+    assert [(z["niveau"], z["lieu"]) for z in zones] == [
+        ("Congestion", "Bronka Port"), ("Congestion", "Kotka"), ("Ralentissement", "Bronka Port")]
+    bronka = zones[0]
+    assert bronka["navires"] == 12 and bronka["cargos_en_attente"] == 8
+    assert bronka["vitesse_moyenne_nd"] == round((0.4 * 9 + 1.0 * 3) / 12, 1)
