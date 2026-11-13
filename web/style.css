@@ -343,6 +343,21 @@ select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .d-anoms li.sev-info { border-left-color: var(--info); }
 .muted { color: var(--muted); }
 
+/* ------------------------------------------------------------- météo marine */
+.wx-arrow { display: grid; place-items: center; pointer-events: auto; }
+.wx-arrow svg, .wx-key svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+.map-legend .lg-wide { grid-column: 1 / -1; flex-wrap: wrap; }
+.wx-key { width: 14px; height: 14px; display: inline-block; transform: rotate(90deg); }
+.feed .f-wx { font-size: 12px; margin-top: 3px; font-weight: 600; }
+.f-wx.wx-0, .f-wx.wx-1 { color: var(--muted); font-weight: 500; }
+.f-wx.wx-2 { color: var(--warn); }
+.f-wx.wx-3 { color: var(--crit); }
+.wx-badge.wx-0 { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+.wx-badge.wx-1 { background: color-mix(in srgb, var(--info) 16%, transparent); color: var(--info); }
+.wx-badge.wx-2 { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+.wx-badge.wx-3 { background: color-mix(in srgb, var(--crit) 16%, transparent); color: var(--crit); }
+.wx-src { font-size: 11.5px; margin: 8px 0 0; }
+
 /* -------------------------------------------------------------- responsive */
 @media (max-width: 860px) {
   #app { grid-template-columns: 1fr; grid-template-rows: 55vh 1fr; }

@@ -2,7 +2,7 @@
 
     python -m maritime.processor
 
-Entrées  : ais.positions, ais.static
+Entrées  : ais.positions, ais.static, weather.marine (Open-Meteo)
 Sorties  : PostgreSQL (état temps réel + historique) ; topics ais.alerts et ais.congestion
 """
 from __future__ import annotations
@@ -21,6 +21,7 @@ from .processing import anomalies as an
 from .processing.congestion import CongestionTracker, VesselSnapshot
 from .processing.eta import ALERT_MAX_DISTANCE_NM, estimate
 from .processing.state import MINUTE_MS, Point, VesselTrack
+from .processing.weather import WeatherIndex, sea_state, weather_note
 
 log = logging.getLogger("processor")
 
@@ -44,6 +45,8 @@ class Processor:
         self.pending_positions: list[dict] = []
         self.pending_vessels: dict[int, dict] = {}
         self.pending_alerts: list[dict] = []
+        self.weather = WeatherIndex()
+        self.pending_weather: list[dict] = []
         self.counters = {"positions": 0, "static": 0, "alerts": 0}
         self.last_lag_s: float | None = None
 
@@ -95,6 +98,20 @@ class Processor:
             eta=eta_dt, draught=msg.get("draught"), length=msg.get("length"), width=msg.get("width"))
         self.counters["static"] += 1
 
+    def handle_weather(self, msg: dict) -> None:
+        if msg.get("lat") is None or msg.get("lon") is None or msg.get("ts") is None:
+            return
+        self.weather.update(msg)
+        self.pending_weather.append(msg)
+
+    def zone_weather(self, lat: float, lon: float) -> dict | None:
+        """Météo la plus proche d'une zone, résumée pour la base, l'API et le LLM."""
+        w = self.weather.nearest(lat, lon)
+        if not w:
+            return None
+        keep = ("wind_kn", "wind_dir", "gust_kn", "visibility_m", "wave_m", "distance_km")
+        return {**{k: w.get(k) for k in keep}, **sea_state(w)}
+
     def handle_position(self, msg: dict) -> None:
         mmsi = int(msg["mmsi"])
         track = self.tracks.get(mmsi)
@@ -128,12 +145,15 @@ class Processor:
     def flush(self) -> None:
         if not self.writer:
             self.pending_positions.clear(); self.pending_vessels.clear(); self.pending_alerts.clear()
+            self.pending_weather.clear()
             return
         # Les fiches navires d'abord (clé étrangère logique des positions)
         self.writer.upsert_vessels(list(self.pending_vessels.values()))
         self.writer.insert_positions(self.pending_positions)
         self.writer.insert_alerts(self.pending_alerts)
+        self.writer.upsert_weather(self.pending_weather)
         self.pending_vessels.clear(); self.pending_positions.clear(); self.pending_alerts.clear()
+        self.pending_weather.clear()
 
     def tick(self) -> None:
         """Traitements périodiques (chaque minute) sur l'ensemble de la flotte active."""
@@ -175,14 +195,17 @@ class Processor:
                 lat, lon = (c.lat_min + c.lat_max) / 2, (c.lon_min + c.lon_max) / 2
                 port = self.ports.nearest(lat, lon, 25) if self.ports else None
                 c.place = port[0].name if port else None
+                c.weather = self.zone_weather(lat, lon)
                 where = f"près de {c.place}" if port else f"({lat:.2f}, {lon:.2f})"
                 self.set_condition(("zone", c.cell_id, c.level), an.Alert(
                     "CONGESTION", "critical" if c.level == "congestion" else "warning", None, now,
                     lat, lon,
                     f"{c.level.capitalize()} {where} : {c.n_vessels} navires, "
-                    f"{c.n_waiting} en attente, vitesse moyenne {c.mean_sog:.1f} nœuds",
+                    f"{c.n_waiting} en attente, vitesse moyenne {c.mean_sog:.1f} nœuds"
+                    f"{weather_note(c.weather)}",
                     {"cell_id": c.cell_id, "level": c.level, "n_vessels": c.n_vessels,
-                     "mean_sog": c.mean_sog, "baseline_sog": c.baseline_sog}))
+                     "mean_sog": c.mean_sog, "baseline_sog": c.baseline_sog,
+                     "weather": c.weather}))
         for key in [k for k in self.active if k[0] == "zone" and k[1] not in flagged]:
             self.active.discard(key)
 
@@ -225,8 +248,10 @@ class Processor:
             self.cooldown[key] = ts
             if kind in PERSISTENT_KINDS:
                 self.active.add(key)
-        log.info("Reprise : %d navires, %d positions, %d zones de référence",
-                 len(vessels), len(positions), len(baselines))
+        for obs in self.writer.load_weather():
+            self.weather.update(obs)
+        log.info("Reprise : %d navires, %d positions, %d zones de référence, %d points météo",
+                 len(vessels), len(positions), len(baselines), len(self.weather))
 
 
 def main() -> None:
@@ -239,7 +264,8 @@ def main() -> None:
     proc = Processor(writer, JsonProducer(), ports)
     proc.warm_start()
 
-    consumer = json_consumer("vigie-processor", [settings.topics.positions, settings.topics.static])
+    consumer = json_consumer("vigie-processor", [settings.topics.positions, settings.topics.static,
+                                                 settings.topics.weather])
     running = True
 
     def stop(*_):
@@ -262,6 +288,8 @@ def main() -> None:
                     continue
                 if msg.topic() == settings.topics.static:
                     proc.handle_static(data)
+                elif msg.topic() == settings.topics.weather:
+                    proc.handle_weather(data)
                 else:
                     proc.handle_position(data)
             t = time.monotonic()

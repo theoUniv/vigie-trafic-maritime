@@ -94,6 +94,7 @@
     vesselLayer.redraw();
     renderZonesLayer();
     renderLegend();
+    if (typeof refreshWeather === "function") refreshWeather();
   };
   themeBtn.addEventListener("click", () => {
     const next = isDark() ? "light" : "dark";
@@ -187,10 +188,12 @@
   const trackLayer = L.layerGroup().addTo(map);
   const zonesLayer = L.layerGroup().addTo(map);
   const alertsLayer = L.layerGroup().addTo(map);
+  const weatherLayer = L.layerGroup().addTo(map);
   L.control.layers(null, {
     "Navires": vesselLayer, "Trajectoire": trackLayer, "Zones de congestion": zonesLayer,
-    "Alertes récentes": alertsLayer, "Balisage OpenSeaMap": seamarks,
+    "Alertes récentes": alertsLayer, "Météo marine (Open-Meteo)": weatherLayer, "Balisage OpenSeaMap": seamarks,
   }, { position: "topright" }).addTo(map);
+  map.attributionControl.addAttribution('Météo <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo</a>');
   L.control.scale({ imperial: false, position: "bottomright" }).addTo(map);
 
   const tip = $("#hover-tip");
@@ -218,6 +221,9 @@
     }
     legend.append(el("span", { class: "lg" }, el("span", { class: "sq", style: `background:${LEVEL.congestion.color()}` }), "Congestion"));
     legend.append(el("span", { class: "lg" }, el("span", { class: "sq", style: `background:${LEVEL.ralentissement.color()}` }), "Ralentissement"));
+    const wx = el("span", { class: "lg lg-wide" });
+    wx.innerHTML = `<span class="wx-key" style="color:${cssVar("--muted")}">${WIND_SVG}</span>Vent (sens)<span class="wx-key" style="color:${cssVar("--warn")}">${WIND_SVG}</span>mer difficile<span class="wx-key" style="color:${cssVar("--crit")}">${WIND_SVG}</span>dangereuse`;
+    legend.append(wx);
   }
 
   // -------------------------------------------------------------------- filtres
@@ -401,6 +407,17 @@
         <div class="d-item"><span>Position</span><b class="mono">${d.lat !== null ? `${d.lat.toFixed(3)}, ${d.lon.toFixed(3)}` : "—"}</b></div>
       </div>
       <div class="d-section"><h3>Voyage</h3>${voyage}</div>
+      ${d.weather ? `<div class="d-section"><h3>Météo sur zone</h3>
+        <span class="delay-badge wx-badge wx-${d.weather.state.level}">Mer ${esc(d.weather.state.label)}</span>
+        <div class="d-grid">
+          <div class="d-item"><span>Vent</span><b>${d.weather.wind_kn !== null ? `${Number(d.weather.wind_kn).toFixed(0)} nd · force ${d.weather.state.beaufort}` : "—"}</b></div>
+          <div class="d-item"><span>Rafales</span><b>${d.weather.gust_kn !== null ? `${Number(d.weather.gust_kn).toFixed(0)} nd` : "—"}</b></div>
+          <div class="d-item"><span>Vagues</span><b>${d.weather.wave_m !== null ? `${Number(d.weather.wave_m).toFixed(1)} m · ${Number(d.weather.wave_period_s || 0).toFixed(0)} s` : "—"}</b></div>
+          <div class="d-item"><span>Visibilité</span><b>${d.weather.visibility_m !== null ? `${(d.weather.visibility_m / 1000).toFixed(0)} km` : "—"}</b></div>
+          <div class="d-item"><span>Eau</span><b>${d.weather.sea_temp_c !== null ? `${Number(d.weather.sea_temp_c).toFixed(1)} °C` : "—"}</b></div>
+          <div class="d-item"><span>Ciel</span><b>${esc(d.weather.state.sky || "—")}</b></div>
+        </div>
+        <p class="muted wx-src">Open-Meteo, relevé ${ago(d.weather.ts)}</p></div>` : ""}
       <div class="d-section"><h3>Profil de vitesse</h3><div class="speed-chart" id="d-speed"><p class="muted">Chargement…</p></div></div>
       <div class="d-section"><h3>Anomalies</h3>${anoms}</div>`;
     if (state.trackPoints) renderSpeedChart(state.trackPoints);
@@ -512,7 +529,14 @@
   }
 
   let zones = [];
-  const zoneTip = (z, lv) => `<b>${lv.label}${z.place ? ` · ${esc(z.place)}` : ""}</b><br>${z.n_vessels} navires · ${z.n_waiting} cargos en attente<br>Vitesse moy. ${Number(z.mean_sog).toFixed(1)} nd${z.baseline_sog ? ` (normale ${Number(z.baseline_sog).toFixed(1)} nd)` : ""}`;
+  // Météo Open-Meteo résumée par le serveur : { level 0–3, label, summary, causes }
+  // Flèches au trait (les navires sont des triangles pleins) : discrètes par mer calme,
+  // orange puis rouge seulement quand la mer devient difficile.
+  const WX_COLOR = () => [cssVar("--faint"), cssVar("--muted"), cssVar("--warn"), cssVar("--crit")];
+  const WX_OPACITY = [0.45, 0.7, 0.95, 1];
+  const WIND_SVG = '<svg viewBox="0 0 24 24"><path d="M12 21V4M6.5 9.5 12 4l5.5 5.5"/></svg>';
+  const wxLine = (w) => (w && w.label ? `Mer ${w.label} · ${w.summary}${w.causes && w.causes.length ? ` (${w.causes.join(", ")})` : ""}` : "");
+  const zoneTip = (z, lv) => `<b>${lv.label}${z.place ? ` · ${esc(z.place)}` : ""}</b><br>${z.n_vessels} navires · ${z.n_waiting} cargos en attente<br>Vitesse moy. ${Number(z.mean_sog).toFixed(1)} nd${z.baseline_sog ? ` (normale ${Number(z.baseline_sog).toFixed(1)} nd)` : ""}${z.weather ? `<br>${esc(wxLine(z.weather))}` : ""}`;
   function renderZonesLayer() {
     zonesLayer.clearLayers();
     const detailed = map.getZoom() >= 9;
@@ -551,7 +575,30 @@
           onclick: () => map.flyToBounds([[z.lat_min, z.lon_min], [z.lat_max, z.lon_max]], { maxZoom: 11, duration: 0.8 }),
         },
         el("div", { class: "f-top" }, el("span", { class: "f-kind" }, `${LEVEL[z.level].label}${z.place ? ` · ${z.place}` : ""}`), el("span", { class: "mono" }, `${lat.toFixed(2)}, ${lon.toFixed(2)}`)),
-        el("div", { class: "f-msg" }, `${z.n_vessels} navires dont ${z.n_waiting} cargos en attente · ${Number(z.mean_sog).toFixed(1)} nd en moyenne${z.baseline_sog ? ` (normale ${Number(z.baseline_sog).toFixed(1)} nd)` : ""}`)));
+        el("div", { class: "f-msg" }, `${z.n_vessels} navires dont ${z.n_waiting} cargos en attente · ${Number(z.mean_sog).toFixed(1)} nd en moyenne${z.baseline_sog ? ` (normale ${Number(z.baseline_sog).toFixed(1)} nd)` : ""}`),
+        z.weather ? el("div", { class: `f-wx wx-${z.weather.level}` }, wxLine(z.weather)) : null));
+      }
+    } catch { /* réessai au prochain cycle */ }
+  }
+
+  // ------------------------------------------------------------ météo marine
+  // Une flèche par point de grille : elle indique où va le vent, sa couleur l'état de la mer.
+  async function refreshWeather() {
+    try {
+      const data = await api("/api/weather");
+      weatherLayer.clearLayers();
+      const colors = WX_COLOR();
+      for (const p of data.points) {
+        if (p.wind_dir === null || p.wind_kn === null) continue;
+        const lvl = p.state.level, size = 14 + Math.min(12, p.wind_kn / 3);
+        const icon = L.divIcon({
+          className: "",
+          html: `<div class="wx-arrow" style="width:${size}px;height:${size}px;color:${colors[lvl]};opacity:${WX_OPACITY[lvl]};transform:rotate(${(p.wind_dir + 180) % 360}deg)">${WIND_SVG}</div>`,
+          iconSize: [size, size], iconAnchor: [size / 2, size / 2],
+        });
+        L.marker([p.lat, p.lon], { icon, keyboard: false, interactive: true, zIndexOffset: -200 })
+          .bindTooltip(`<b>Mer ${esc(p.state.label)}</b><br>Vent ${Number(p.wind_kn).toFixed(0)} nd (force ${p.state.beaufort}), rafales ${Number(p.gust_kn ?? 0).toFixed(0)} nd<br>Vagues ${Number(p.wave_m).toFixed(1)} m, période ${Number(p.wave_period_s ?? 0).toFixed(0)} s<br>${esc(p.state.sky || "")}${p.sea_temp_c !== null ? ` · eau ${Number(p.sea_temp_c).toFixed(1)} °C` : ""}`, { direction: "top" })
+          .addTo(weatherLayer);
       }
     } catch { /* réessai au prochain cycle */ }
   }
@@ -803,6 +850,8 @@
   refreshZones();
   refreshBriefing();
   refreshLlmStatus();
+  refreshWeather();
+  setInterval(refreshWeather, 10 * 60000);
   setInterval(refreshVessels, 15000);
   setInterval(refreshBriefing, 60000);
   setInterval(refreshLlmStatus, 30000);

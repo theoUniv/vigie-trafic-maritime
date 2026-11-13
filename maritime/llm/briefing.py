@@ -24,6 +24,8 @@ Sens des champs (ne les confonds pas) :
 - alertes_total : nombre d'ALERTES détectées sur la période (ce n'est pas un nombre de navires).
 - zones[].cargos_en_attente : cargos à l'arrêt ou au mouillage dans la zone.
 - zones[].vitesse_habituelle_nd : vitesse normale apprise pour la zone, à comparer à vitesse_moyenne_nd.
+- zones[].meteo : météo marine Open-Meteo au plus près de la zone. Si la mer est « difficile » ou
+  « dangereuse », cite-la comme cause probable du ralentissement ; si elle est calme, ne l'invoque pas.
 
 Format, en texte brut, sans numérotation, sans titre ni gras :
 - Commence directement par une ou deux phrases de synthèse (nombre de navires actifs, niveau d'activité).
@@ -98,6 +100,10 @@ def _merge_zones(cells: list[dict]) -> list[dict]:
         if z is None:
             merged[key] = z = {"niveau": LEVEL_LABELS[c["level"]], "lieu": place, "navires": 0,
                                "cargos_en_attente": 0, "_sog": [], "_base": []}
+            w = c.get("weather")
+            if w and w.get("label"):
+                z["meteo"] = f"mer {w['label']} : {w['summary']}" + (
+                    f" ({', '.join(w['causes'])})" if w.get("causes") else "")
         z["navires"] += c.get("n_vessels") or 0
         z["cargos_en_attente"] += c.get("n_waiting") or 0
         if c.get("mean_sog") is not None:

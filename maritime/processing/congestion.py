@@ -46,6 +46,7 @@ class CellStat:
     level: str
     mmsis: list[int]
     place: str | None = None   # port le plus proche (renseigné par le processeur)
+    weather: dict | None = None   # météo marine la plus proche (renseignée par le processeur)
 
     def to_dict(self) -> dict:
         return asdict(self)

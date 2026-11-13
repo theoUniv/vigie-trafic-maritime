@@ -24,6 +24,7 @@ class Topics:
     alerts: str = "ais.alerts"
     congestion: str = "ais.congestion"
     briefings: str = "ais.briefings"
+    weather: str = "weather.marine"
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,11 @@ class Settings:
     ais_gap_min: int = field(default_factory=lambda: _env_int("AIS_GAP_MIN", 20))
     alert_cooldown_min: int = field(default_factory=lambda: _env_int("ALERT_COOLDOWN_MIN", 30))
     ports_cache: str = field(default_factory=lambda: _env("PORTS_CACHE", "data/ports.json"))
+
+    # Météo marine Open-Meteo (open data, sans clé) : grille "sud,ouest,nord,est" au pas "dlat,dlon"
+    weather_bbox: str = field(default_factory=lambda: _env("WEATHER_BBOX", "53.5,9.5,66,30.5"))
+    weather_step: str = field(default_factory=lambda: _env("WEATHER_STEP", "0.5,1"))
+    weather_interval_min: int = field(default_factory=lambda: _env_int("WEATHER_INTERVAL_MIN", 90))
 
     # LLM open source servi localement par Ollama (vide = fonctionnalités IA désactivées)
     llm_url: str = field(default_factory=lambda: _env("LLM_URL", "http://localhost:11434"))
