@@ -86,6 +86,26 @@ CREATE TABLE IF NOT EXISTS congestion_current (
     mmsis         BIGINT[]
 );
 ALTER TABLE congestion_current ADD COLUMN IF NOT EXISTS place TEXT;
+ALTER TABLE congestion_current ADD COLUMN IF NOT EXISTS weather JSONB;
+
+-- Météo marine Open-Meteo : dernière observation par point de grille, et historique
+CREATE TABLE IF NOT EXISTS weather_current (
+    lat            DOUBLE PRECISION NOT NULL,
+    lon            DOUBLE PRECISION NOT NULL,
+    ts             TIMESTAMPTZ NOT NULL,
+    wind_kn        REAL,
+    wind_dir       REAL,
+    gust_kn        REAL,
+    visibility_m   REAL,
+    weather_code   SMALLINT,
+    wave_m         REAL,
+    wave_dir       REAL,
+    wave_period_s  REAL,
+    sea_temp_c     REAL,
+    PRIMARY KEY (lat, lon)
+);
+CREATE TABLE IF NOT EXISTS weather_history (LIKE weather_current);
+CREATE INDEX IF NOT EXISTS weather_history_ts_idx ON weather_history (ts);
 CREATE TABLE IF NOT EXISTS congestion_history (
     ts         TIMESTAMPTZ NOT NULL,
     cell_id    TEXT NOT NULL,
@@ -231,12 +251,13 @@ class Writer:
             cur.executemany(
                 """
                 INSERT INTO congestion_current (cell_id, ts, lat_min, lon_min, lat_max, lon_max,
-                    n_vessels, n_waiting, mean_sog, baseline_sog, score, level, mmsis, place)
+                    n_vessels, n_waiting, mean_sog, baseline_sog, score, level, mmsis, place, weather)
                 VALUES (%(cell_id)s, now(), %(lat_min)s, %(lon_min)s, %(lat_max)s, %(lon_max)s,
                     %(n_vessels)s, %(n_waiting)s, %(mean_sog)s, %(baseline_sog)s, %(score)s,
-                    %(level)s, %(mmsis)s, %(place)s)
+                    %(level)s, %(mmsis)s, %(place)s, %(weather_json)s)
                 """,
-                cells,
+                [{**c, "weather_json": json.dumps(c["weather"]) if c.get("weather") else None}
+                 for c in cells],
             )
             cur.executemany(
                 """
@@ -249,6 +270,20 @@ class Writer:
                 cells,
             )
 
+    def upsert_weather(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        cols = ("lat, lon, ts, wind_kn, wind_dir, gust_kn, visibility_m, weather_code, wave_m, "
+                "wave_dir, wave_period_s, sea_temp_c")
+        vals = ("%(lat)s, %(lon)s, to_timestamp(%(ts)s / 1000.0), %(wind_kn)s, %(wind_dir)s, "
+                "%(gust_kn)s, %(visibility_m)s, %(weather_code)s, %(wave_m)s, %(wave_dir)s, "
+                "%(wave_period_s)s, %(sea_temp_c)s")
+        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols.split(", ")[2:])
+        with self.conn.cursor() as cur:
+            cur.executemany(f"INSERT INTO weather_current ({cols}) VALUES ({vals}) "
+                            f"ON CONFLICT (lat, lon) DO UPDATE SET {updates}", rows)
+            cur.executemany(f"INSERT INTO weather_history ({cols}) VALUES ({vals})", rows)
+
     def record_stats(self, positions: int, static_msgs: int, alerts: int, lag_s: float | None) -> None:
         self.conn.execute(
             "INSERT INTO ingest_stats VALUES (now(), %s, %s, %s, %s) ON CONFLICT DO NOTHING",
@@ -256,7 +291,7 @@ class Writer:
         )
 
     def prune(self, retention_hours: int) -> None:
-        for table in ("positions", "congestion_history", "ingest_stats"):
+        for table in ("positions", "congestion_history", "ingest_stats", "weather_history"):
             self.conn.execute(f"DELETE FROM {table} WHERE ts < now() - make_interval(hours => %s)",
                               (retention_hours,))
         self.conn.execute("DELETE FROM anomalies WHERE ts < now() - make_interval(hours => %s)",
@@ -282,3 +317,11 @@ class Writer:
                       details->>'level'
                FROM anomalies WHERE ts > now() - interval '3 hours' ORDER BY ts""").fetchall()
         return vessels, positions, baselines, alerts
+
+    def load_weather(self) -> list[dict]:
+        cur = self.conn.execute(
+            """SELECT lat, lon, (extract(epoch FROM ts) * 1000)::bigint AS ts, wind_kn, wind_dir,
+                      gust_kn, visibility_m, weather_code, wave_m, wave_dir, wave_period_s, sea_temp_c
+               FROM weather_current WHERE ts > now() - interval '6 hours'""")
+        names = [d.name for d in cur.description]
+        return [dict(zip(names, row)) for row in cur.fetchall()]

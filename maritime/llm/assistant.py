@@ -66,6 +66,12 @@ TOOLS = [
                        "Aussi pour « résume la situation ».",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
+        "name": "sea_conditions",
+        "description": "Météo marine actuelle (Open-Meteo) : vent, vagues, visibilité, points où la mer "
+                       "est la plus dure. Pour « quel temps fait-il en mer ? » ou « la météo explique-t-elle "
+                       "les ralentissements ? ». Les zones (congestion_zones) ont aussi leur météo.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "latest_briefing",
         "description": "Dernier bulletin de situation rédigé automatiquement.",
         "parameters": {"type": "object", "properties": {}}}},
@@ -78,7 +84,8 @@ Règles :
 - Réponds toujours en français, de façon concise : quelques phrases, ou une liste de 5 éléments
   maximum avec UNE ligne par élément. Pas de gras ni de titres markdown.
 - Choix de l'outil : « combien ... ? » ou « résume » → traffic_stats ; « quels navires / quels cargos ... ? »
-  (une liste de navires) → search_vessels avec les bons filtres (category, status, query) ; zones → congestion_zones.
+  (une liste de navires) → search_vessels avec les bons filtres (category, status, query) ; zones → congestion_zones ;
+  météo, vent, vagues → sea_conditions.
 - Pour toute question sur les navires, zones, alertes ou chiffres, appelle d'abord les outils.
   N'invente jamais de navire, de chiffre ni de position : appuie-toi uniquement sur leurs résultats.
 - Quand tu cites un navire, donne son nom suivi de son MMSI entre parenthèses, ex. « VIKING GRACE (230629000) ».

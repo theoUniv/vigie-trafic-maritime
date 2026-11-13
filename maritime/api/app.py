@@ -22,6 +22,7 @@ from ..config import settings
 from ..llm.assistant import Assistant
 from ..llm.client import LLMError, OllamaClient
 from ..processing.anomalies import KIND_LABELS
+from ..processing.weather import sea_state
 
 WEB_DIR = Path(os.environ.get("WEB_DIR", Path(__file__).resolve().parents[2] / "web"))
 pool: ConnectionPool | None = None
@@ -153,7 +154,36 @@ def vessel(mmsi: int):
         WHERE mmsi = %(m)s ORDER BY ts DESC LIMIT 20""", {"m": mmsi})
     for a in v["anomalies"]:
         a["label"] = KIND_LABELS.get(a["kind"], a["kind"])
+    v["weather"] = nearest_weather(v["lat"], v["lon"]) if v["lat"] is not None else None
     return v
+
+
+WEATHER_COLS = ("lat, lon, ts, wind_kn, wind_dir, gust_kn, visibility_m, weather_code, wave_m, "
+                "wave_dir, wave_period_s, sea_temp_c")
+
+
+def nearest_weather(lat: float, lon: float, max_deg: float = 1.2) -> dict | None:
+    """Observation Open-Meteo la plus proche (distance approchée, la grille est au demi-degré)."""
+    rows = q(f"""
+        SELECT {WEATHER_COLS} FROM weather_current
+        WHERE ts > now() - interval '6 hours'
+          AND lat BETWEEN %(lat)s - %(d)s AND %(lat)s + %(d)s
+          AND lon BETWEEN %(lon)s - 2 * %(d)s AND %(lon)s + 2 * %(d)s
+        ORDER BY power(lat - %(lat)s, 2) + power((lon - %(lon)s) * cos(radians(%(lat)s)), 2)
+        LIMIT 1""", {"lat": lat, "lon": lon, "d": max_deg})
+    if not rows:
+        return None
+    return {**rows[0], "state": sea_state(rows[0])}
+
+
+@app.get("/api/weather")
+def weather():
+    """Météo marine Open-Meteo sur la grille de points en mer (vent, rafales, vagues, visibilité)."""
+    rows = q(f"SELECT {WEATHER_COLS} FROM weather_current WHERE ts > now() - interval '6 hours'")
+    for r in rows:
+        r["state"] = sea_state(r)
+    return {"count": len(rows), "points": rows,
+            "source": "Open-Meteo (CC BY 4.0)"}
 
 
 @app.get("/api/vessels/{mmsi}/track")
@@ -173,7 +203,7 @@ def congestion(min_level: str = "dense"):
               "congestion": ["congestion"]}.get(min_level, ["congestion"])
     return q("""
         SELECT cell_id, ts, lat_min, lon_min, lat_max, lon_max, n_vessels, n_waiting, mean_sog,
-               baseline_sog, score, level, place
+               baseline_sog, score, level, place, weather
         FROM congestion_current WHERE level = ANY(%(l)s) ORDER BY score DESC""", {"l": levels})
 
 
@@ -287,6 +317,7 @@ def tool_vessel_details(mmsi: int) -> dict:
         "position": {"lat": _num(v["lat"], 3), "lon": _num(v["lon"], 3)} if v["lat"] is not None else None,
         "derniere_position": v["position_ts"], "destination": v["destination"],
         "eta_declaree": v["eta"], "eta_estimee": est or None,
+        "meteo_sur_zone": _meteo((v.get("weather") or {}).get("state")),
         "anomalies_recentes": [{"date": a["ts"], "type": a["label"], "message": a["message"]}
                                for a in v["anomalies"][:5]],
     }
@@ -300,8 +331,18 @@ def tool_congestion_zones(min_level: str = "ralentissement") -> dict:
     return {"nombre_zones": len(zones), "zones": [
         {"niveau": ZONE_LABELS.get(z["level"], z["level"]), "lieu": z["place"] or "en mer",
          "navires_dans_la_zone": z["n_vessels"], "cargos_en_attente": z["n_waiting"],
-         "vitesse_moyenne_nd": _num(z["mean_sog"]), "vitesse_habituelle_nd": _num(z["baseline_sog"])}
+         "vitesse_moyenne_nd": _num(z["mean_sog"]), "vitesse_habituelle_nd": _num(z["baseline_sog"]),
+         "meteo": _meteo(z.get("weather"))}
         for z in zones[:8]]}
+
+
+def _meteo(w: dict | None) -> str | None:
+    """« difficile : vent 25,0 nd, vagues 2,6 m (vent fort) » : une ligne lisible pour le LLM."""
+    if not w or "label" not in w:
+        return None
+    causes = f" ({', '.join(w['causes'])})" if w.get("causes") else ""
+    return f"mer {w['label']} : {w['summary']}{causes}"
+
 
 
 def tool_recent_alerts(hours: float = 2, kind: str | None = None, limit: int = 15) -> dict:
@@ -325,6 +366,22 @@ def tool_traffic_stats() -> dict:
     }
 
 
+def tool_sea_conditions() -> dict:
+    """Synthèse de la météo marine : répartition par état de la mer et points les plus durs."""
+    pts = weather()["points"]
+    if not pts:
+        return {"info": "pas encore de données météo (collecte toutes les 90 min)"}
+    from collections import Counter
+    counts = Counter(p["state"]["label"] for p in pts)
+    worst = sorted(pts, key=lambda p: (-p["state"]["level"], -(p["wind_kn"] or 0)))[:6]
+    return {"points_de_mesure": len(pts),
+            "repartition_etat_de_la_mer": dict(counts),
+            "vent_max_nd": max((p["wind_kn"] or 0) for p in pts),
+            "vagues_max_m": max((p["wave_m"] or 0) for p in pts),
+            "points_les_plus_durs": [{"lat": p["lat"], "lon": p["lon"], "meteo": _meteo(p["state"])}
+                                     for p in worst]}
+
+
 def tool_latest_briefing() -> dict:
     rows = briefings(1)
     return {"date": rows[0]["ts"], "texte": rows[0]["text"]} if rows else {"info": "aucun bulletin pour le moment"}
@@ -337,6 +394,7 @@ assistant = Assistant(llm, {
     "recent_alerts": tool_recent_alerts,
     "traffic_stats": tool_traffic_stats,
     "latest_briefing": tool_latest_briefing,
+    "sea_conditions": tool_sea_conditions,
 })
 
 

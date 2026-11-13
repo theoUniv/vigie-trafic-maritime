@@ -24,6 +24,7 @@ Le tout est restitué sur une **carte web interactive** avec filtres et suivi d'
 | Suivre un navire en particulier | Fiche navire, trajectoire sur 2 h, 6 h ou 24 h, profil de vitesse et mode **« Suivre »** (la carte reste centrée) |
 | Visualiser le trafic mondial ou régional sur une carte | Carte Leaflet en canvas (plusieurs milliers de navires orientés selon leur cap), couches zones, alertes et balisage OpenSeaMap |
 | Interface dynamique avec filtres (nom, type, pays) | Recherche (nom, MMSI, IMO, indicatif, destination), filtres type, pavillon, état et commerce, actualisation toutes les 15 s |
+| *Bonus* : deuxième source open data | **Météo marine Open-Meteo** (vent, rafales, vagues, visibilité) collectée dans Kafka : elle explique les ralentissements de zone, s'affiche sur la carte et alimente le LLM |
 | *Bonus* : IA générative open source | **Bulletin de situation** rédigé toutes les 15 min et **assistant conversationnel** qui interroge la base, avec un LLM à poids ouverts (Qwen 2.5) exécuté localement par **Ollama** |
 | Analyse et modèle de prédiction (rappels) | Notebook `notebooks/analyse_trafic.ipynb` : data viz matplotlib, **prévision de position à 10 min** et **Isolation Forest** |
 | Architecture Big Data (rappels) | **Kafka → Spark Structured Streaming** : un job PySpark agrège `ais.positions` par fenêtres de 5 min (trafic par zone et type de navire, fréquentation des ports) et écrit dans PostgreSQL |
@@ -38,10 +39,12 @@ flowchart LR
         DT["Digitraffic AIS<br/>REST · Baltique"]
         AS["aisstream.io<br/>WebSocket · mondial"]
         PT["Gazetteer des ports<br/>12 000 UN/LOCODE"]
+        OM["Open-Meteo<br/>vent · vagues"]
     end
 
     subgraph Ingestion
         P["producer<br/>collecte / 60 s"]
+        WX["weather<br/>collecte / 90 min"]
     end
 
     subgraph Kafka["Apache Kafka (KRaft)"]
@@ -50,6 +53,7 @@ flowchart LR
         T3[("ais.alerts")]
         T4[("ais.congestion")]
         T5[("ais.briefings")]
+        T6[("weather.marine")]
     end
 
     subgraph Traitement
@@ -71,7 +75,8 @@ flowchart LR
     DT --> P
     AS -.-> P
     P --> T1 & T2
-    T1 & T2 --> PR
+    OM --> WX --> T6
+    T1 & T2 & T6 --> PR
     PT --> PR
     PR --> T3 & T4
     PR --> DB
@@ -93,6 +98,7 @@ flowchart LR
 | `kafka` | Broker Apache Kafka 3.8 en mode KRaft (sans ZooKeeper) | 9092 |
 | `kafka-ui` | Exploration des topics et des messages | [8080](http://localhost:8080) |
 | `producer` | Collecte AIS → Kafka | – |
+| `weather` | Collecte Open-Meteo (vent, vagues) → Kafka `weather.marine`, toutes les 90 min | – |
 | `processor` | Kafka → détection → PostgreSQL et topics d'alertes | – |
 | `postgres` | Stockage de l'état courant, de l'historique et des alertes | 5433 |
 | `api` | API REST et interface web | [8000](http://localhost:8000) |
@@ -154,6 +160,7 @@ navire). Le reste du pipeline est identique.
 | Positions et fiches navires AIS | [Digitraffic — Fintraffic](https://www.digitraffic.fi/en/marine-traffic/) (`/api/ais/v1/locations`, `/vessels`) | CC BY 4.0 |
 | Positions AIS mondiales (optionnel) | [aisstream.io](https://aisstream.io) | Conditions aisstream |
 | Ports (UN/LOCODE et coordonnées) | Digitraffic Port Call API | CC BY 4.0 |
+| Météo marine (vent, rafales, visibilité, vagues, température de l'eau) | [Open-Meteo](https://open-meteo.com) : API Forecast et Marine | CC BY 4.0 |
 | Balisage maritime | [OpenSeaMap](https://www.openseamap.org) | CC BY-SA |
 | Fond de carte | Esri World Gray Canvas | Attribution |
 | Pavillon | Déduit du MMSI (MID, table ITU) | – |
@@ -200,6 +207,39 @@ le spam d'alertes.
 La destination AIS est un champ libre saisi par l'équipage (`FI HEL`, `HELSINKI`, `FI/HANKO`,
 `EE TLL>FI HEL`…). Elle est résolue vers un port géolocalisé par code LOCODE, par nom normalisé
 ou par alias. Les itinéraires multi-escales (`SESTO<>FIMHQ<>FIHEL`) sont volontairement ignorés.
+
+---
+
+## Météo marine : Open-Meteo
+
+Une deuxième source open data, [Open-Meteo](https://open-meteo.com) (sans clé, CC BY 4.0), donne
+le contexte météo des ralentissements. Une zone qui ralentit par vent de force 7 n'a pas la même
+signification qu'une zone qui ralentit par mer calme.
+
+- **Collecte** : le service `weather` interroge l'API Forecast (vent à 10 m, rafales, visibilité,
+  temps) et l'API Marine (hauteur, direction et période des vagues, température de l'eau) sur une
+  grille de 0,5° × 1° couvrant la Baltique. Au premier passage, les points à terre (sans vagues) sont
+  écartés et la liste des 191 points en mer est mémorisée. Chaque relevé est publié sur le topic
+  Kafka `weather.marine` ; le producteur AIS n'est pas modifié.
+- **Quota** : chez Open-Meteo, un point compte comme un appel (gratuit : 600 par minute, 10 000 par
+  jour). Le collecteur étale ses requêtes et relève la grille toutes les 90 min, soit environ
+  6 100 appels par jour (`WEATHER_INTERVAL_MIN`, `WEATHER_STEP`, `WEATHER_BBOX`).
+- **Traitement** : le processeur consomme `weather.marine`, stocke `weather_current` et
+  `weather_history`, et rattache à chaque zone de congestion ou de ralentissement la météo du point
+  le plus proche (120 km au plus). L'état de la mer est classé en 4 niveaux (calme, agitée,
+  difficile, dangereuse) d'après l'échelle de Beaufort pour le vent et l'échelle de Douglas pour la
+  mer. Par mer difficile, l'alerte de zone le dit : « … — météo : vent fort (27 nd, force 6) ».
+- **Restitution** : couche « Météo marine » sur la carte (une flèche par point, orientée dans le sens
+  du vent et colorée selon l'état de la mer), météo dans la liste des zones et dans la fiche navire.
+  Le bulletin du LLM cite la météo comme cause probable quand la mer est difficile, et l'assistant a
+  un outil `sea_conditions`.
+
+| Niveau | Vent | Mer | Autres |
+|---|---|---|---|
+| calme | < 17 nd | < 1,25 m | |
+| agitée | 17 à 21 nd | 1,25 à 2,5 m | |
+| difficile | ≥ 22 nd (force 6) | ≥ 2,5 m (mer forte) | visibilité < 1 km, orage |
+| dangereuse | ≥ 34 nd (coup de vent) ou rafales ≥ 44 nd | ≥ 4 m (très forte) | |
 
 ---
 
@@ -315,6 +355,7 @@ Paramètres (`.env`) : `SPARK_WINDOW`, `SPARK_WATERMARK`, `SPARK_TRIGGER`, `SPAR
 | `GET /api/anomalies?hours=6&kind=` | Flux d'alertes |
 | `GET /api/stats` | Indicateurs, répartition par type, débit d'ingestion |
 | `GET /api/meta` | Valeurs disponibles pour les filtres |
+| `GET /api/weather` | Météo marine Open-Meteo sur la grille (vent, vagues, état de la mer) |
 | `GET /api/briefings?limit=10` | Derniers bulletins de situation |
 | `POST /api/ask` | Question en langage naturel à l'assistant (`{"question": "...", "history": [...]}`), réponse diffusée en NDJSON (`tool`, `token`, `done`) |
 | `GET /api/llm/status` | État du LLM (activé, modèle téléchargé) |
@@ -352,10 +393,11 @@ uv venv && uv pip install -e ".[analysis,dev]"     # ou : pip install -e ".[anal
 .venv/bin/python -m pytest
 ```
 
-Les 76 tests couvrent la géographie, le décodage AIS (ETA, pavillons, valeurs sentinelles), la
+Les 92 tests couvrent la géographie, le décodage AIS (ETA, pavillons, valeurs sentinelles), la
 résolution des destinations, les détecteurs d'anomalies, la congestion et l'estimation d'ETA.
 Ils couvrent aussi la couche IA (faits du bulletin, gabarit de repli, boucle d'appel d'outils),
-testée avec un faux client, donc sans LLM.
+testée avec un faux client, donc sans LLM, et la météo marine (lecture des réponses Open-Meteo,
+état de la mer, rattachement aux zones).
 
 `tests/test_spark.py` couvre le job Spark : lecture des messages, grille calculée par Spark identique
 à celle de Python, agrégats par fenêtre, zone, type et port. Les tests qui demandent Spark sont
@@ -376,9 +418,10 @@ maritime/
   geo.py               distances, grille spatiale
   ports.py             gazetteer UN/LOCODE et résolution des destinations
   kafka_io.py          topics, producteur et consommateur JSON
-  sources/             digitraffic.py (REST), aisstream.py (WebSocket)
+  sources/             digitraffic.py (REST), aisstream.py (WebSocket), openmeteo.py (météo)
+  weather.py           collecte Open-Meteo → Kafka (weather.marine)
   producer.py          collecte → Kafka
-  processing/          state, anomalies, congestion, eta (logique pure)
+  processing/          state, anomalies, congestion, eta, weather (logique pure)
   processor.py         Kafka → détection → PostgreSQL et topics d'alertes
   db.py                schéma et écritures PostgreSQL
   llm/                 client Ollama, bulletin (faits + prompt), assistant (outils)
